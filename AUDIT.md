@@ -332,12 +332,12 @@ Implementation defects, ordered by unblocking value. Design work is ordered sepa
 
 | # | Fix | Effort | Why here |
 |---|---|---|---|
-| 1 | Delete the `react-router` import in `invites.ts:1` | Trivial | Nothing else can be tested until the backend compiles |
+| ~~1~~ | ~~Delete the `react-router` import in `invites.ts:1`~~ | — | **Done.** Backend compiles and runs; end-to-end flow verified |
 | 2 | Add `GET /api/jobs/:jobId/image/:kind` serving `uploads/`, tenant-scoped | Small | The product currently cannot show a user their own result |
 | 3 | Authenticate the SSE stream by a means `EventSource` can carry | Small | Restores the entire real-time leg |
 | 4 | Worker reports completion to the API instead of writing the DB; one hub serves clients | Medium | Fixes the trust boundary and the dead broadcasts together — §2.2 |
 | 5 | Migration adding indexes, the `credit_balance >= 0` CHECK, and working RLS (`SET LOCAL` + `FORCE`) | Medium | The cross-tenant leak is the highest-severity latent risk |
-| 6 | Correct amqplib types (`ChannelModel`) and null guards | Small | Clears 6 of 7 backend compile errors |
+| ~~6~~ | ~~Correct amqplib types (`ChannelModel`) and null guards~~ | — | **Done.** `tsc --noEmit` is clean |
 | 7 | Reaper for abandoned `PENDING`/`PROCESSING` jobs; DLQ; idempotency key | Medium | Stops credit leakage and silent message loss |
 | 8 | S3 lifecycle/retention rules; real VIP consumer or remove the routing stub | Medium | Compliance gap, plus VIP jobs currently hang forever |
 | — | ~~`apiFetch` body serialization~~ | — | **Resolved** by the Next.js migration |
@@ -348,8 +348,10 @@ Implementation defects, ordered by unblocking value. Design work is ordered sepa
 ## 7. How to reproduce this audit
 
 ```bash
-cd backend  && npx tsc --noEmit     # expect the 7 errors in §3
-cd frontend && npx tsc --noEmit     # expect 0 after migration; was 10 at 9b53949
+cd backend  && npx tsc --noEmit     # 7 errors at 9b53949; 0 after fixes #1 and #6
+cd frontend && npx tsc --noEmit     # 10 errors at 9b53949; 0 after the Next.js migration
 ```
 
-End-to-end verification is **blocked on fix #1**. Until the `react-router` import is removed, `npm run dev` cannot start and no runtime claim about this system can be validated.
+**Status update.** Fixes #1 and #6 have since been applied. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job. Every other finding in this document stands as written and was verified against commit `9b53949`.
+
+Local infrastructure note: `docker-compose.override.yml` (gitignored) publishes the Postgres container on **5433**, because a locally installed PostgreSQL already occupies 5432 with different credentials. `DATABASE_URL` in `backend/.env` points there.

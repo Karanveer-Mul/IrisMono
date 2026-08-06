@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Local-machine compose overrides
+docker-compose.override.yml
+
 # Secrets — .env.example is tracked, .env is not
 .env
 .env.local

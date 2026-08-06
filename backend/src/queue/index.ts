@@ -2,25 +2,29 @@ import * as amqp from "amqplib";
 
 const AMQP_URL = process.env.AMQP_URL || "amqp://guest:guest@localhost:5672";
 
-let connection: amqp.Connection | null = null;
+// amqplib >= 0.10.5 resolves connect() to ChannelModel, not Connection.
+let connection: amqp.ChannelModel | null = null;
 let channel: amqp.Channel | null = null;
 
 export async function initQueue() {
   try {
-    connection = await amqp.connect(AMQP_URL);
-    channel = await connection.createChannel();
-    
+    const conn = await amqp.connect(AMQP_URL);
+    connection = conn;
+
+    const ch = await conn.createChannel();
+    channel = ch;
+
     // Declare standard jobs queue
-    await channel.assertQueue("queue-standard-jobs", { durable: true });
-    
+    await ch.assertQueue("queue-standard-jobs", { durable: true });
+
     console.log("RabbitMQ queue connection initialized.");
-    
-    connection.on("error", (err) => {
+
+    conn.on("error", (err) => {
       console.error("AMQP Connection error:", err);
       reconnect();
     });
 
-    connection.on("close", () => {
+    conn.on("close", () => {
       console.log("AMQP Connection closed. Reconnecting...");
       reconnect();
     });
