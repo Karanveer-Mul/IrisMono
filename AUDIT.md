@@ -216,7 +216,7 @@ Two standard remedies, neither implemented:
 - Issue a short-lived, single-purpose stream token and pass it as a query parameter, validated separately from the main JWT.
 - Move authentication to an httpOnly cookie, which `EventSource` sends automatically (requires `withCredentials` and CORS work if origins ever split).
 
-*Status:* **carried forward unfixed.** The chosen frontend data layer keeps the JWT in localStorage, so this requires a backend change.
+*Status:* **resolved.** `POST /api/auth/stream-token` mints a 60-second token carrying `purpose: "stream"`; the SSE route authenticates from `?token=`, and `authenticateJWT` explicitly refuses stream tokens so a leaked URL cannot be replayed against the rest of the API.
 
 ### BLOCKER — results are never actually displayed
 
@@ -224,7 +224,7 @@ Two standard remedies, neither implemented:
 
 Compounding it, both panes reference the *same* image, with the mask pane faking a visual difference via `filter: hue-rotate(180deg) saturate(3)` (`MaskUploader.tsx:230`). The mask the worker actually wrote to `uploads/<jobId>-mask.png` is never rendered anywhere in the product.
 
-*Status:* **carried forward unfixed** — requires a backend GET route. The Next.js port corrects the mask pane's `src` and removes the cosmetic filter, so the wiring is right and waits only on the server.
+*Status:* **resolved.** `GET /api/jobs/:jobId/image/:kind` serves the stored PNG after confirming the job belongs to the caller's organization. The client fetches it as a blob (`JobImage.tsx`) because an `<img src>` cannot carry the Bearer header.
 
 ### HIGH — crash on the failure path
 
@@ -333,12 +333,12 @@ Implementation defects, ordered by unblocking value. Design work is ordered sepa
 | # | Fix | Effort | Why here |
 |---|---|---|---|
 | ~~1~~ | ~~Delete the `react-router` import in `invites.ts:1`~~ | — | **Done.** Backend compiles and runs; end-to-end flow verified |
-| 2 | Add `GET /api/jobs/:jobId/image/:kind` serving `uploads/`, tenant-scoped | Small | The product currently cannot show a user their own result |
-| 3 | Authenticate the SSE stream by a means `EventSource` can carry | Small | Restores the entire real-time leg |
-| 4 | Worker reports completion to the API instead of writing the DB; one hub serves clients | Medium | Fixes the trust boundary and the dead broadcasts together — §2.2 |
-| 5 | Migration adding indexes, the `credit_balance >= 0` CHECK, and working RLS (`SET LOCAL` + `FORCE`) | Medium | The cross-tenant leak is the highest-severity latent risk |
+| ~~2~~ | ~~Add `GET /api/jobs/:jobId/image/:kind` serving `uploads/`, tenant-scoped~~ | — | **Done.** Tenant-scoped; cross-tenant reads 404, anonymous reads 401 |
+| ~~3~~ | ~~Authenticate the SSE stream by a means `EventSource` can carry~~ | — | **Done.** 60s purpose-scoped stream token; rejected as a Bearer credential |
+| ~~4~~ | ~~Worker reports completion to the API instead of writing the DB; one hub serves clients~~ | — | **Done.** Worker holds no DB credentials; events now reach browser clients |
+| 5 | **Partially done.** Indexes and the `credit_balance >= 0` CHECK shipped in migration `0001`. **RLS is still outstanding** and remains the highest-severity latent risk | Medium | See the note below on why RLS was not bundled |
 | ~~6~~ | ~~Correct amqplib types (`ChannelModel`) and null guards~~ | — | **Done.** `tsc --noEmit` is clean |
-| 7 | Reaper for abandoned `PENDING`/`PROCESSING` jobs; DLQ; idempotency key | Medium | Stops credit leakage and silent message loss |
+| 7 | Reaper for abandoned `PENDING`/`PROCESSING` jobs; DLQ | Medium | Stops credit leakage and silent message loss. Report replay is now refused (409), so double-refund is closed |
 | 8 | S3 lifecycle/retention rules; real VIP consumer or remove the routing stub | Medium | Compliance gap, plus VIP jobs currently hang forever |
 | — | ~~`apiFetch` body serialization~~ | — | **Resolved** by the Next.js migration |
 | — | ~~Missing `Sparkles` import~~ | — | **Resolved** by the Next.js migration |
@@ -352,6 +352,22 @@ cd backend  && npx tsc --noEmit     # 7 errors at 9b53949; 0 after fixes #1 and 
 cd frontend && npx tsc --noEmit     # 10 errors at 9b53949; 0 after the Next.js migration
 ```
 
-**Status update.** Fixes #1 and #6 have since been applied. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job. Every other finding in this document stands as written and was verified against commit `9b53949`.
+### Why RLS was not shipped with the rest of fix #5
+
+Enabling RLS is not additive — done partially it takes the system down, and done carelessly it produces the *appearance* of isolation without the substance. Three things must land together:
+
+1. **A non-superuser database role.** The app connects as `postgres`, which is a superuser, and **superusers bypass RLS unconditionally** — `FORCE ROW LEVEL SECURITY` closes the table-owner hole but not the superuser one. Policies would be silently inert.
+2. **`SET LOCAL` inside every request transaction.** With a shared `pg.Pool`, a session-level `SET` leaks to whichever request borrows that connection next (§2.5). Every tenant-scoped query therefore has to move inside a transaction that sets the org context first.
+3. **A bypass path for authentication.** `users` carries the policy, but login looks a user up by email *before* any organization context exists. Under RLS that query returns zero rows and nobody can sign in. This needs a separate role or an explicitly exempted code path.
+
+Shipping 1 and 2 without 3 breaks login for every user; shipping 2 without 1 looks correct and protects nothing. It is a coherent unit of work, not a migration.
+
+**Status update.** Fixes #1, #2, #3, #4, and #6 have since been applied, along with the index and CHECK portion of #5. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+
+Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
+
+Every remaining finding in this document stands as written and was verified against commit `9b53949`.
+
+One further defect, found while re-verifying: **`src/test-flow.ts` is not idempotent.** It registers hardcoded email addresses, so a second run aborts at step 1 with `409 Email is already registered` and the tables must be truncated between runs.
 
 Local infrastructure note: `docker-compose.override.yml` (gitignored) publishes the Postgres container on **5433**, because a locally installed PostgreSQL already occupies 5432 with different credentials. `DATABASE_URL` in `backend/.env` points there.

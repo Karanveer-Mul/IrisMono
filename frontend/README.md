@@ -45,11 +45,22 @@ Notable changes from the Vite version:
 - **`apiFetch` serializes object bodies.** The old version passed plain objects straight to `fetch`, which stringified them to `[object Object]` — every POST from the UI was rejected by the backend's JSON parser. See `AUDIT.md`.
 - **Fonts come from `next/font`** rather than a Google Fonts `<link>` in `index.html`.
 
-## Known broken — blocked on the backend
+## Two things worth knowing
 
-Both are documented in `../AUDIT.md`; neither can be fixed from this side.
+**Live updates use a separate token.** `EventSource` cannot set an `Authorization` header, so `Dashboard.tsx` first calls `POST /api/auth/stream-token` for a 60-second token and passes it to the stream as `?token=`. That token is scoped to the stream — the API refuses it as a Bearer credential.
 
-1. **Live job updates never arrive.** `GET /api/jobs/events` sits behind Bearer-only JWT middleware, and the `EventSource` API cannot set request headers, so the SSE stream 401s and closes immediately. The subscription is left wired up in `Dashboard.tsx` and will start working the moment the backend accepts a credential `EventSource` can carry. Meanwhile the dashboard stays usable because every mutation also refetches.
-2. **Result images do not render.** The API exposes only `PUT /api/jobs/mock-upload/:jobId` and serves nothing for reading. `MaskUploader.tsx` points at the proposed `GET /api/jobs/:jobId/image/:kind` (AUDIT fix #2); until that route exists both preview panes fall back to a placeholder.
+**Job images are fetched as blobs.** `GET /api/jobs/:jobId/image/:kind` is tenant-scoped behind the normal session, which an `<img src>` cannot satisfy, so `JobImage.tsx` fetches the bytes with the token attached and renders an object URL.
 
-**Full end-to-end verification is blocked on AUDIT fix #1** — the backend does not currently compile, so the API cannot start at all.
+## Running the whole stack
+
+The backend needs Postgres and RabbitMQ:
+
+```bash
+cd ../backend
+docker compose up -d
+npm run db:migrate
+npm run dev          # API on :3000
+npm run worker:dev   # GPU worker, separate terminal
+```
+
+Then `npm run dev` here for the UI on :3001.

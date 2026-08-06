@@ -114,3 +114,26 @@ export async function apiFetch(path: string, options: ApiOptions = {}) {
 
   return data;
 }
+
+/**
+ * Fetches a binary resource with the session token attached and returns an
+ * object URL for it.
+ *
+ * Job images are tenant-scoped behind the normal Bearer session, and an
+ * <img src> cannot carry that header - so the bytes are fetched here and handed
+ * to the tag as a blob URL. Callers must revokeObjectURL when done.
+ */
+export async function apiFetchObjectUrl(path: string): Promise<string> {
+  const token = getToken();
+  const headers = new Headers();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  const response = await fetch(path, { headers });
+  if (!response.ok) {
+    throw new Error(`Request failed with status ${response.status}`);
+  }
+
+  return URL.createObjectURL(await response.blob());
+}

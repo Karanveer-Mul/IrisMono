@@ -74,34 +74,48 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
   useEffect(() => {
     loadProfileAndLogs();
 
+    let eventSource: EventSource | null = null;
+    let cancelled = false;
+
     /**
      * SSE connection. Receives real-time job status events from the backend.
      *
-     * KNOWN BROKEN - see AUDIT.md. GET /api/jobs/events sits behind Bearer-only
-     * JWT middleware and EventSource cannot set request headers, so this always
-     * 401s and closes. Left wired up so it starts working the moment the backend
-     * accepts a credential EventSource can actually carry. The dashboard stays
-     * usable meanwhile because every mutation also calls loadProfileAndLogs().
+     * EventSource cannot set an Authorization header, so the stream is
+     * authenticated with a short-lived token minted for this purpose and passed
+     * in the query string. The token expires in 60s, which only has to outlast
+     * the handshake - the connection itself stays open afterwards.
      */
-    const eventSource = new EventSource("/api/jobs/events");
-
-    eventSource.addEventListener("JOB_STATUS_CHANGE", (e: MessageEvent) => {
+    const connect = async () => {
       try {
-        const data = JSON.parse(e.data);
-        console.log("[SSE Event] Job status change received:", data);
-        loadProfileAndLogs();
-      } catch (err) {
-        console.error("Error processing SSE message data:", err);
-      }
-    });
+        const { token } = await apiFetch("/api/auth/stream-token", { method: "POST" });
+        if (cancelled) return;
 
-    eventSource.onerror = (err) => {
-      console.error("SSE stream connection error. Closing stream.", err);
-      eventSource.close();
+        eventSource = new EventSource(`/api/jobs/events?token=${encodeURIComponent(token)}`);
+
+        eventSource.addEventListener("JOB_STATUS_CHANGE", (e: MessageEvent) => {
+          try {
+            const data = JSON.parse(e.data);
+            console.log("[SSE Event] Job status change received:", data);
+            loadProfileAndLogs();
+          } catch (err) {
+            console.error("Error processing SSE message data:", err);
+          }
+        });
+
+        eventSource.onerror = (err) => {
+          console.error("SSE stream connection error. Closing stream.", err);
+          eventSource?.close();
+        };
+      } catch (err) {
+        console.error("Could not open the live job event stream:", err);
+      }
     };
 
+    connect();
+
     return () => {
-      eventSource.close();
+      cancelled = true;
+      eventSource?.close();
     };
   }, [user.id, loadProfileAndLogs]);
 

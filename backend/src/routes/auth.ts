@@ -5,7 +5,7 @@ import { eq, and } from "drizzle-orm";
 import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
 import { isEmailDomainAllowed, getEmailDomain } from "../utils/domain";
-import { authenticateJWT, AuthenticatedRequest } from "../middleware/auth";
+import { authenticateJWT, AuthenticatedRequest, issueStreamToken } from "../middleware/auth";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-change-in-production";
@@ -248,6 +248,17 @@ router.get("/profile", authenticateJWT, async (req: AuthenticatedRequest, res: R
     console.error("Profile load error:", error);
     return res.status(500).json({ error: "Failed to load user profile" });
   }
+});
+
+/**
+ * 5. Mint a short-lived token for the SSE stream
+ *
+ * EventSource cannot send an Authorization header, so the stream is
+ * authenticated by query parameter instead. These tokens expire in 60 seconds
+ * and are rejected by the normal API middleware.
+ */
+router.post("/stream-token", authenticateJWT, (req: AuthenticatedRequest, res: Response) => {
+  return res.status(200).json({ token: issueStreamToken(req.user!) });
 });
 
 export default router;

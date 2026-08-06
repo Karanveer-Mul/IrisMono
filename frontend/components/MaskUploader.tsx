@@ -2,6 +2,7 @@
 
 import React, { useState, useRef } from "react";
 import { apiFetch } from "@/lib/api";
+import { JobImage } from "./JobImage";
 import { UploadCloud, CheckCircle, AlertTriangle, Cpu, Sparkles } from "lucide-react";
 
 interface JobInfo {
@@ -16,18 +17,6 @@ interface MaskUploaderProps {
   onJobCreated: () => void;
   activeJob: JobInfo | null;
   onJobFinalized: () => void;
-}
-
-/**
- * Result image URLs.
- *
- * TODO(backend): these 404 today. The API exposes only PUT /api/jobs/mock-upload/:jobId
- * and serves nothing for reading - see AUDIT.md fix #2, which proposes a
- * tenant-scoped GET /api/jobs/:jobId/image/:kind. The wiring here is correct and
- * waits on that route; until then both panes fall back to the placeholder.
- */
-function jobImageUrl(jobId: string, kind: "raw" | "mask") {
-  return `/api/jobs/${jobId}/image/${kind}`;
 }
 
 export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUploaderProps) {
@@ -224,25 +213,11 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
           <div className="preview-layout">
             <div className="preview-panel">
               <span className="preview-title">Input Subject Scan</span>
-              <img
-                src={jobImageUrl(activeJob.id, "raw")}
-                alt="Input Raw"
-                className="preview-img"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src = "https://placehold.co/300x200/222/555?text=Image+Not+Found";
-                }}
-              />
+              <JobImage jobId={activeJob.id} kind="raw" alt="Input Raw" fallbackLabel="Scan unavailable" />
             </div>
             <div className="preview-panel">
               <span className="preview-title">Segmented Mask Output</span>
-              <img
-                src={jobImageUrl(activeJob.id, "mask")}
-                alt="Segmented Mask"
-                className="preview-img"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src = "https://placehold.co/300x200/222/555?text=Mask+Unavailable";
-                }}
-              />
+              <JobImage jobId={activeJob.id} kind="mask" alt="Segmented Mask" fallbackLabel="Mask unavailable" />
             </div>
           </div>
 
