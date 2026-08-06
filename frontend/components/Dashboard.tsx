@@ -1,5 +1,8 @@
-import React, { useState, useEffect } from "react";
-import { apiFetch, removeToken, UserContext } from "../utils/api";
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import { apiFetch, removeToken } from "@/lib/api";
+import type { UserContext } from "@/lib/api";
 import { MaskUploader } from "./MaskUploader";
 import { InviteManager } from "./InviteManager";
 import { LogOut, Coins, ShieldCheck, ClipboardList, Clock, Layers } from "lucide-react";
@@ -29,35 +32,36 @@ interface DashboardProps {
 export function Dashboard({ user, onLogout }: DashboardProps) {
   const [org, setOrg] = useState<OrganizationInfo | null>(null);
   const [logs, setLogs] = useState<AuditLog[]>([]);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<AuditLog | null>(null);
   const [glowCredits, setGlowCredits] = useState(false);
 
-  useEffect(() => {
-    loadProfileAndLogs();
-    initializeSSE();
-  }, [user.id]);
+  // Read inside callbacks that outlive a single render (SSE handler, timers),
+  // where the state value itself would be captured stale.
+  const activeJobIdRef = useRef<string | null>(null);
 
-  const loadProfileAndLogs = async () => {
+  const loadProfileAndLogs = useCallback(async () => {
     try {
       // 1. Fetch user org profile details
       const profile = await apiFetch("/api/auth/profile");
-      
-      // Trigger glow animation if balance increased (refund) or decreased
-      if (org && org.creditBalance !== profile.organization.creditBalance) {
-        setGlowCredits(true);
-        setTimeout(() => setGlowCredits(false), 1500);
-      }
 
-      setOrg(profile.organization);
+      // Trigger glow animation if balance changed (spend or refund)
+      setOrg((prev) => {
+        if (prev && prev.creditBalance !== profile.organization.creditBalance) {
+          setGlowCredits(true);
+          setTimeout(() => setGlowCredits(false), 1500);
+        }
+        return profile.organization;
+      });
 
       // 2. Fetch jobs audit logs list
       const logsRes = await apiFetch("/api/jobs/logs");
-      setLogs(logsRes.logs || []);
+      const list: AuditLog[] = logsRes.logs || [];
+      setLogs(list);
 
       // If tracking an active job, sync it
-      if (activeJobId) {
-        const found = (logsRes.logs as AuditLog[]).find((j) => j.id === activeJobId);
+      const trackedId = activeJobIdRef.current;
+      if (trackedId) {
+        const found = list.find((j) => j.id === trackedId);
         if (found) {
           setActiveJob(found);
         }
@@ -65,22 +69,26 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     } catch (err) {
       console.error("Failed to load dashboard profile info:", err);
     }
-  };
+  }, []);
 
-  /**
-   * SSE connection initialization.
-   * Receives real-time update events from backend.
-   */
-  const initializeSSE = () => {
-    console.log("Subscribing to real-time Server-Sent Events (SSE)...");
+  useEffect(() => {
+    loadProfileAndLogs();
+
+    /**
+     * SSE connection. Receives real-time job status events from the backend.
+     *
+     * KNOWN BROKEN - see AUDIT.md. GET /api/jobs/events sits behind Bearer-only
+     * JWT middleware and EventSource cannot set request headers, so this always
+     * 401s and closes. Left wired up so it starts working the moment the backend
+     * accepts a credential EventSource can actually carry. The dashboard stays
+     * usable meanwhile because every mutation also calls loadProfileAndLogs().
+     */
     const eventSource = new EventSource("/api/jobs/events");
 
-    eventSource.addEventListener("JOB_STATUS_CHANGE", (e: any) => {
+    eventSource.addEventListener("JOB_STATUS_CHANGE", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
         console.log("[SSE Event] Job status change received:", data);
-
-        // Reload data to reflect credit changes and new logs
         loadProfileAndLogs();
       } catch (err) {
         console.error("Error processing SSE message data:", err);
@@ -95,25 +103,22 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     return () => {
       eventSource.close();
     };
-  };
+  }, [user.id, loadProfileAndLogs]);
 
-  const handleJobCreated = () => {
-    // Reload logs immediately to capture new PENDING job
-    loadProfileAndLogs();
-    
-    // Find the latest pending job to set as active track
-    setTimeout(async () => {
-      const logsRes = await apiFetch("/api/jobs/logs");
-      const list = logsRes.logs as AuditLog[];
-      if (list.length > 0) {
-        setActiveJobId(list[0].id);
-        setActiveJob(list[0]);
-      }
-    }, 500);
+  const handleJobCreated = async () => {
+    // Reload logs immediately to capture the new PENDING job
+    await loadProfileAndLogs();
+
+    const logsRes = await apiFetch("/api/jobs/logs");
+    const list = (logsRes.logs || []) as AuditLog[];
+    if (list.length > 0) {
+      activeJobIdRef.current = list[0].id;
+      setActiveJob(list[0]);
+    }
   };
 
   const handleJobFinalized = () => {
-    setActiveJobId(null);
+    activeJobIdRef.current = null;
     setActiveJob(null);
     loadProfileAndLogs();
   };
@@ -125,7 +130,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
   return (
     <div className="app-container">
-      
+
       {/* Premium Header */}
       <header className="main-header">
         <div className="logo-container">
@@ -134,7 +139,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
         </div>
 
         <div className="header-right">
-          
+
           {/* Org details */}
           {org && (
             <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
@@ -154,10 +159,10 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
           </span>
 
           {/* Logout Button */}
-          <button 
+          <button
             id="logout-btn"
-            className="btn btn-secondary" 
-            style={{ padding: "0.45rem 1rem", fontSize: "0.85rem" }} 
+            className="btn btn-secondary"
+            style={{ padding: "0.45rem 1rem", fontSize: "0.85rem" }}
             onClick={handleLogoutClick}
           >
             <LogOut size={14} />
@@ -168,15 +173,14 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
       {/* Main Grid Content */}
       <main className="grid-container" style={{ flex: 1 }}>
-        
+
         {/* Left Side: Mask Uploader & Logs */}
         <div style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
-          
-          {/* Mask Uploader Component */}
-          <MaskUploader 
-            onJobCreated={handleJobCreated} 
-            activeJob={activeJob} 
-            onJobFinalized={handleJobFinalized} 
+
+          <MaskUploader
+            onJobCreated={handleJobCreated}
+            activeJob={activeJob}
+            onJobFinalized={handleJobFinalized}
           />
 
           {/* Audit Logs / Processing History */}
@@ -184,10 +188,10 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
             <div className="card-header" style={{ marginBottom: "1rem" }}>
               <h3 style={{ fontSize: "1.1rem", fontWeight: 700, display: "flex", alignItems: "center", gap: "0.5rem" }}>
                 <ClipboardList size={18} style={{ color: "var(--accent-teal)" }} />
-                <span>Logs & Audits</span>
+                <span>Logs &amp; Audits</span>
               </h3>
             </div>
-            
+
             <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginBottom: "1rem" }}>
               Permanent logs maintained indefinitely for medical compliance, billing auditing, and status inspections.
             </p>
@@ -210,7 +214,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                   <tbody>
                     {logs.map((log) => (
                       <tr key={log.id} className="job-log-row" id={`row-${log.id}`}>
-                        <td 
+                        <td
                           className="job-id-cell"
                           style={{ fontFamily: "monospace", fontSize: "0.75rem", color: "var(--accent-teal)", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis" }}
                         >
@@ -231,7 +235,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                             {log.status}
                           </span>
                         </td>
-                        <td 
+                        <td
                           className="mask-path-cell"
                           style={{ fontSize: "0.75rem", color: "var(--text-secondary)", maxWidth: "250px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                         >
@@ -254,7 +258,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
         {/* Right Side: Credits Balance & Invite Whitelist Manager */}
         <div style={{ display: "flex", flexDirection: "column", gap: "2rem" }}>
-          
+
           {/* Credit balance Widget */}
           <div className={`glass-card ${glowCredits ? "glow-card" : ""}`} style={{ transition: "box-shadow 0.3s ease, border-color 0.3s ease" }}>
             <h3 style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.75rem" }}>
@@ -265,7 +269,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                 <Coins size={28} />
               </div>
               <div>
-                <div 
+                <div
                   id="credit-balance-display"
                   style={{ fontSize: "2rem", fontWeight: 800, color: org && org.creditBalance === 0 ? "var(--accent-red)" : "#ffffff" }}
                 >

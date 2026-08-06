@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from "react";
-import { apiFetch } from "../utils/api";
+"use client";
+
+import React, { useState, useEffect, useCallback } from "react";
+import { apiFetch } from "@/lib/api";
 import { Users, Link2, Plus, Power, ShieldAlert, Check, Globe, X } from "lucide-react";
 
 interface InviteInfo {
@@ -19,19 +21,12 @@ export function InviteManager({ orgId }: InviteManagerProps) {
   const [allowedDomains, setAllowedDomains] = useState<string[]>([]);
   const [newDomain, setNewDomain] = useState("");
   const [invites, setInvites] = useState<InviteInfo[]>([]);
-  
-  const [loading, setLoading] = useState(false);
+
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
-  // Load organization allowed domains and existing invites on mount
-  useEffect(() => {
-    fetchWhitelistAndInvites();
-  }, [orgId]);
-
-  const fetchWhitelistAndInvites = async () => {
+  const fetchWhitelistAndInvites = useCallback(async () => {
     try {
-      setLoading(true);
       setError(null);
 
       // 1. Fetch whitelisted domains
@@ -43,10 +38,13 @@ export function InviteManager({ orgId }: InviteManagerProps) {
       setInvites(invitesRes.invites || []);
     } catch (err: any) {
       setError(err.message || "Failed to load team details");
-    } finally {
-      setLoading(false);
     }
-  };
+  }, []);
+
+  // Load organization allowed domains and existing invites on mount
+  useEffect(() => {
+    fetchWhitelistAndInvites();
+  }, [orgId, fetchWhitelistAndInvites]);
 
   const handleAddDomain = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,8 +62,8 @@ export function InviteManager({ orgId }: InviteManagerProps) {
         },
       });
       setAllowedDomains(res.allowedDomains);
-      setNewDomain("");
       setSuccess(`Whitelisted domain '${newDomain}' successfully`);
+      setNewDomain("");
     } catch (err: any) {
       setError(err.message || "Failed to add domain to whitelist");
     }
@@ -99,7 +97,7 @@ export function InviteManager({ orgId }: InviteManagerProps) {
         method: "POST",
       });
       setInvites([res.invite, ...invites]);
-      
+
       const inviteUrl = `${window.location.origin}/join/${res.invite.inviteCode}`;
       setSuccess(`Created invite link: ${inviteUrl}`);
       navigator.clipboard.writeText(inviteUrl).catch(() => {});
@@ -133,7 +131,7 @@ export function InviteManager({ orgId }: InviteManagerProps) {
       </div>
 
       <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>
-        Control registration access. Users can only register if their email matches one of the organization's whitelisted domain patterns.
+        Control registration access. Users can only register if their email matches one of the organization&apos;s whitelisted domain patterns.
       </p>
 
       {error && (
@@ -155,17 +153,17 @@ export function InviteManager({ orgId }: InviteManagerProps) {
         <h3 style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.5rem" }}>
           Whitelisted Domain List
         </h3>
-        
+
         <div className="whitelist-tags" style={{ marginBottom: "1rem" }}>
           {allowedDomains.map((dom) => (
             <span key={dom} className="whitelist-tag" id={`tag-${dom}`}>
               <Globe size={12} style={{ color: "var(--accent-teal)" }} />
               <span>{dom}</span>
-              <X 
+              <X
                 id={`remove-domain-${dom}`}
-                size={12} 
-                className="tag-remove" 
-                onClick={() => handleRemoveDomain(dom)} 
+                size={12}
+                className="tag-remove"
+                onClick={() => handleRemoveDomain(dom)}
               />
             </span>
           ))}
@@ -181,10 +179,10 @@ export function InviteManager({ orgId }: InviteManagerProps) {
             value={newDomain}
             onChange={(e) => setNewDomain(e.target.value)}
           />
-          <button 
+          <button
             id="add-domain-btn"
-            type="submit" 
-            className="btn btn-secondary" 
+            type="submit"
+            className="btn btn-secondary"
             style={{ padding: "0.6rem 1rem", fontSize: "0.85rem" }}
           >
             <Plus size={16} />
@@ -200,9 +198,9 @@ export function InviteManager({ orgId }: InviteManagerProps) {
         <h3 style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.75rem" }}>
           Reusable Invite Codes
         </h3>
-        <button 
+        <button
           id="generate-invite-btn"
-          className="btn btn-primary" 
+          className="btn btn-primary"
           style={{ width: "100%", height: "40px", fontSize: "0.85rem" }}
           onClick={handleGenerateInvite}
         >
@@ -215,13 +213,13 @@ export function InviteManager({ orgId }: InviteManagerProps) {
       {invites.length > 0 && (
         <div style={{ flex: 1, overflowY: "auto", maxHeight: "220px", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
           {invites.map((invite) => (
-            <div 
-              key={invite.id} 
-              className="glass-card" 
+            <div
+              key={invite.id}
+              className="glass-card"
               style={{ padding: "0.85rem", display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(0,0,0,0.15)", borderRadius: "8px" }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem", overflow: "hidden" }}>
-                <span 
+                <span
                   className="invite-code-span"
                   style={{ fontSize: "0.8rem", fontWeight: 600, color: invite.isActive ? "var(--text-primary)" : "var(--text-muted)", textDecoration: invite.isActive ? "none" : "line-through" }}
                 >

@@ -1,33 +1,32 @@
-import React, { useState, useEffect } from "react";
-import { apiFetch, setToken, decodeUserFromToken, UserContext } from "../utils/api";
+"use client";
+
+import React, { useState } from "react";
+import { useRouter } from "next/navigation";
+import { apiFetch, setToken, decodeUserFromToken } from "@/lib/api";
+import type { UserContext } from "@/lib/api";
 import { Shield, Sparkles, Building2, UserPlus, KeyRound } from "lucide-react";
+
+type AuthTab = "login" | "register-org" | "join-invite";
 
 interface AuthProps {
   onAuthSuccess: (user: UserContext) => void;
+  /** Pre-filled when landing on /join/<code>. */
+  initialInviteCode?: string;
 }
 
-export function Auth({ onAuthSuccess }: AuthProps) {
-  // Tabs: 'login' | 'register-org' | 'join-invite'
-  const [activeTab, setActiveTab] = useState<"login" | "register-org" | "join-invite">("login");
-  
+export function Auth({ onAuthSuccess, initialInviteCode }: AuthProps) {
+  const router = useRouter();
+
+  const [activeTab, setActiveTab] = useState<AuthTab>(
+    initialInviteCode ? "join-invite" : "login"
+  );
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [orgName, setOrgName] = useState("");
-  const [inviteCode, setInviteCode] = useState("");
+  const [inviteCode, setInviteCode] = useState(initialInviteCode ?? "");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-
-  // Check URL path on mount for active invite code link: e.g. /join/inv_1234
-  useEffect(() => {
-    const path = window.location.pathname;
-    if (path.includes("/join/")) {
-      const parts = path.split("/join/");
-      if (parts.length === 2 && parts[1].trim() !== "") {
-        setInviteCode(parts[1].trim());
-        setActiveTab("join-invite");
-      }
-    }
-  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,7 +35,7 @@ export function Auth({ onAuthSuccess }: AuthProps) {
 
     try {
       let endpoint = "/api/auth/login";
-      let payload: any = { email, password };
+      let payload: Record<string, string> = { email, password };
 
       if (activeTab === "register-org") {
         endpoint = "/api/auth/register";
@@ -57,9 +56,9 @@ export function Auth({ onAuthSuccess }: AuthProps) {
         setToken(res.token);
         const decodedUser = decodeUserFromToken(res.token);
         if (decodedUser) {
-          // If we logged in/registered, clean invite code URL path history
+          // Drop the invite code from the URL once it has been consumed
           if (activeTab === "join-invite") {
-            window.history.replaceState({}, document.title, "/");
+            router.replace("/");
           }
           onAuthSuccess(decodedUser);
         } else {
@@ -76,7 +75,7 @@ export function Auth({ onAuthSuccess }: AuthProps) {
   return (
     <div className="auth-wrapper">
       <div className="auth-container">
-        
+
         {/* Brand Header */}
         <div style={{ textAlign: "center", marginBottom: "2rem" }}>
           <div style={{ display: "inline-flex", padding: "10px", background: "rgba(0,242,254,0.06)", borderRadius: "12px", border: "1px solid rgba(0,242,254,0.15)", marginBottom: "1rem" }}>
@@ -88,21 +87,21 @@ export function Auth({ onAuthSuccess }: AuthProps) {
 
         {/* Tab Controls */}
         <div className="auth-tabs">
-          <div 
+          <div
             id="tab-login"
             className={`auth-tab ${activeTab === "login" ? "active" : ""}`}
             onClick={() => { setActiveTab("login"); setError(null); }}
           >
             Sign In
           </div>
-          <div 
+          <div
             id="tab-register"
             className={`auth-tab ${activeTab === "register-org" ? "active" : ""}`}
             onClick={() => { setActiveTab("register-org"); setError(null); }}
           >
             Create Workspace
           </div>
-          <div 
+          <div
             id="tab-join"
             className={`auth-tab ${activeTab === "join-invite" ? "active" : ""}`}
             onClick={() => { setActiveTab("join-invite"); setError(null); }}
@@ -123,7 +122,7 @@ export function Auth({ onAuthSuccess }: AuthProps) {
           )}
 
           <form onSubmit={handleSubmit}>
-            
+
             {activeTab === "register-org" && (
               <div className="form-group">
                 <label className="form-label" htmlFor="org-name-input">Hospital / Organization Name</label>
@@ -192,10 +191,10 @@ export function Auth({ onAuthSuccess }: AuthProps) {
               />
             </div>
 
-            <button 
+            <button
               id="auth-submit-btn"
-              type="submit" 
-              className="btn btn-primary" 
+              type="submit"
+              className="btn btn-primary"
               style={{ width: "100%", height: "48px" }}
               disabled={loading}
             >

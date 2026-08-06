@@ -1,6 +1,8 @@
+"use client";
+
 import React, { useState, useRef } from "react";
-import { apiFetch } from "../utils/api";
-import { UploadCloud, Image as ImageIcon, CheckCircle, AlertTriangle, Cpu } from "lucide-react";
+import { apiFetch } from "@/lib/api";
+import { UploadCloud, CheckCircle, AlertTriangle, Cpu, Sparkles } from "lucide-react";
 
 interface JobInfo {
   id: string;
@@ -16,12 +18,24 @@ interface MaskUploaderProps {
   onJobFinalized: () => void;
 }
 
+/**
+ * Result image URLs.
+ *
+ * TODO(backend): these 404 today. The API exposes only PUT /api/jobs/mock-upload/:jobId
+ * and serves nothing for reading - see AUDIT.md fix #2, which proposes a
+ * tenant-scoped GET /api/jobs/:jobId/image/:kind. The wiring here is correct and
+ * waits on that route; until then both panes fall back to the placeholder.
+ */
+function jobImageUrl(jobId: string, kind: "raw" | "mask") {
+  return `/api/jobs/${jobId}/image/${kind}`;
+}
+
 export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUploaderProps) {
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
-  
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDrag = (e: React.DragEvent) => {
@@ -98,7 +112,7 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
       }
 
       setUploadProgress("Queuing job in message broker...");
-      
+
       // 3. Trigger queue execution
       await apiFetch(`/api/jobs/${jobId}/trigger`, {
         method: "POST",
@@ -146,7 +160,7 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
 
       {/* Upload trigger panel */}
       {!uploading && !activeJob && (
-        <div 
+        <div
           id="dropzone-box"
           className={`uploader-box ${dragActive ? "dragover" : ""}`}
           onDragEnter={handleDrag}
@@ -166,7 +180,7 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
           <UploadCloud size={48} className="uploader-icon" />
           <div>
             <p style={{ fontWeight: 600, fontSize: "0.95rem", marginBottom: "0.25rem" }}>
-              Drag & drop raw scan scan, or <span style={{ color: "var(--accent-teal)" }}>browse</span>
+              Drag &amp; drop raw scan, or <span style={{ color: "var(--accent-teal)" }}>browse</span>
             </p>
             <p style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>
               Supports exactly 1 RAW or standard medical scan image at a time
@@ -188,7 +202,7 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
         <div style={{ textAlign: "center", padding: "3rem 1rem" }}>
           <div className="spinner" style={{ marginBottom: "1.5rem" }} />
           <div style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem", color: "var(--accent-teal)", fontWeight: 600, marginBottom: "0.5rem" }}>
-            <Cpu size={18} className="spinner-icon" />
+            <Cpu size={18} />
             <span>GPU Workers Segmenting...</span>
           </div>
           <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>
@@ -210,10 +224,9 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
           <div className="preview-layout">
             <div className="preview-panel">
               <span className="preview-title">Input Subject Scan</span>
-              {/* Point to mock local upload location */}
-              <img 
-                src={`/api/jobs/mock-upload/${activeJob.id}`} 
-                alt="Input Raw" 
+              <img
+                src={jobImageUrl(activeJob.id, "raw")}
+                alt="Input Raw"
                 className="preview-img"
                 onError={(e) => {
                   (e.target as HTMLImageElement).src = "https://placehold.co/300x200/222/555?text=Image+Not+Found";
@@ -222,23 +235,21 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
             </div>
             <div className="preview-panel">
               <span className="preview-title">Segmented Mask Output</span>
-              {/* Point to raw path replicated by worker */}
-              <img 
-                src={`/api/jobs/mock-upload/${activeJob.id}`} 
-                alt="Segmented Mask" 
+              <img
+                src={jobImageUrl(activeJob.id, "mask")}
+                alt="Segmented Mask"
                 className="preview-img"
-                style={{ filter: "hue-rotate(180deg) saturate(3)" }} // Visual highlight for mock
                 onError={(e) => {
-                  (e.target as HTMLImageElement).src = "https://placehold.co/300x200/222/555?text=Mask+Wiped";
+                  (e.target as HTMLImageElement).src = "https://placehold.co/300x200/222/555?text=Mask+Unavailable";
                 }}
               />
             </div>
           </div>
 
-          <button 
+          <button
             id="reset-uploader-btn"
-            className="btn btn-secondary" 
-            style={{ width: "100%", marginTop: "1.5rem" }} 
+            className="btn btn-secondary"
+            style={{ width: "100%", marginTop: "1.5rem" }}
             onClick={handleReset}
           >
             Upload Another Image

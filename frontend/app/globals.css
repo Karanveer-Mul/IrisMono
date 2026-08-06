@@ -4,7 +4,7 @@
   --panel-dark: rgba(17, 24, 39, 0.7);
   --border-color: rgba(255, 255, 255, 0.08);
   --border-glow: rgba(0, 242, 254, 0.15);
-  
+
   --accent-teal: #00f2fe;
   --accent-indigo: #4f46e5;
   --accent-emerald: #10b981;
@@ -14,12 +14,14 @@
   --text-primary: #f3f4f6;
   --text-secondary: #9ca3af;
   --text-muted: #6b7280;
-  
+
   --shadow-premium: 0 10px 30px -10px rgba(0, 0, 0, 0.7);
   --shadow-glow: 0 0 20px rgba(0, 242, 254, 0.25);
-  
-  --font-heading: 'Outfit', sans-serif;
-  --font-body: 'Inter', sans-serif;
+
+  /* Supplied by next/font in app/layout.tsx - replaces the Google Fonts
+     <link> tags the Vite index.html used to carry. */
+  --font-heading: var(--font-outfit), sans-serif;
+  --font-body: var(--font-inter), sans-serif;
 }
 
 * {
@@ -91,6 +93,7 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: 800;
   background: linear-gradient(135deg, #ffffff 0%, var(--accent-teal) 100%);
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 

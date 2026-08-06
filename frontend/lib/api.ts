@@ -11,6 +11,7 @@ export interface UserContext {
  * Save JWT token to localStorage
  */
 export function setToken(token: string) {
+  if (typeof window === "undefined") return;
   localStorage.setItem(TOKEN_KEY, token);
 }
 
@@ -18,6 +19,7 @@ export function setToken(token: string) {
  * Get JWT token from localStorage
  */
 export function getToken(): string | null {
+  if (typeof window === "undefined") return null;
   return localStorage.getItem(TOKEN_KEY);
 }
 
@@ -25,6 +27,7 @@ export function getToken(): string | null {
  * Remove JWT token (Logout)
  */
 export function removeToken() {
+  if (typeof window === "undefined") return;
   localStorage.removeItem(TOKEN_KEY);
 }
 
@@ -36,11 +39,11 @@ export function decodeUserFromToken(token: string | null): UserContext | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
-    
-    // Decode base64 payload
-    const payloadJson = atob(parts[1]);
-    const payload = JSON.parse(payloadJson);
-    
+
+    // Decode base64url payload
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const payload = JSON.parse(atob(base64));
+
     return {
       id: payload.id,
       email: payload.email,
@@ -53,32 +56,53 @@ export function decodeUserFromToken(token: string | null): UserContext | null {
   }
 }
 
+type ApiOptions = Omit<RequestInit, "body"> & { body?: unknown };
+
 /**
- * Centralized fetch handler to make authenticated requests to backend API
+ * Centralized fetch handler to make authenticated requests to backend API.
+ *
+ * Object bodies are serialized to JSON here. Passing a plain object straight
+ * through to fetch() stringifies it as "[object Object]", which the Express
+ * json parser rejects - see AUDIT.md, "every browser-originated POST sent a
+ * malformed body".
  */
-export async function apiFetch(path: string, options: RequestInit = {}) {
+export async function apiFetch(path: string, options: ApiOptions = {}) {
   const token = getToken();
-  
-  const headers = new Headers(options.headers || {});
-  if (!headers.has("Content-Type") && !(options.body instanceof FormData)) {
-    headers.set("Content-Type", "application/json");
+  const { body, ...rest } = options;
+
+  const headers = new Headers(rest.headers || {});
+
+  // Anything fetch can send as-is passes through untouched; everything else
+  // is treated as a JSON payload.
+  const isRawBody =
+    body instanceof FormData ||
+    body instanceof Blob ||
+    body instanceof ArrayBuffer ||
+    body instanceof URLSearchParams ||
+    typeof body === "string";
+
+  let payload: BodyInit | undefined;
+  if (body !== undefined && body !== null) {
+    if (isRawBody) {
+      payload = body as BodyInit;
+    } else {
+      payload = JSON.stringify(body);
+      if (!headers.has("Content-Type")) {
+        headers.set("Content-Type", "application/json");
+      }
+    }
   }
-  
+
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
 
-  const config: RequestInit = {
-    ...options,
-    headers,
-  };
+  const response = await fetch(path, { ...rest, headers, body: payload });
 
-  const response = await fetch(path, config);
-  
   // Handle empty content or stream endpoints (like SSE) without json parsing
   const contentType = response.headers.get("content-type");
   let data: any = null;
-  
+
   if (contentType && contentType.includes("application/json")) {
     data = await response.json();
   }
