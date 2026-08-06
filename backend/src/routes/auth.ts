@@ -1,5 +1,8 @@
 import { Router, Request, Response } from "express";
-import { db } from "../db";
+// Registration, login, and invite redemption all identify a row before any
+// organization context exists (by email, or by invite code), so they run on the
+// RLS-bypassing system identity. Everything with a known tenant uses withTenant.
+import { systemDb, withTenant } from "../db";
 import { organizations, users, organizationInvites } from "../db/schema";
 import { eq, and } from "drizzle-orm";
 import * as bcrypt from "bcryptjs";
@@ -24,7 +27,7 @@ router.post("/register", async (req: Request, res: Response) => {
 
   try {
     // Check if user already exists
-    const existingUser = await db.query.users.findFirst({
+    const existingUser = await systemDb.query.users.findFirst({
       where: eq(users.email, email),
     });
 
@@ -38,7 +41,7 @@ router.post("/register", async (req: Request, res: Response) => {
     }
 
     // Start database transaction
-    const token = await db.transaction(async (tx) => {
+    const token = await systemDb.transaction(async (tx) => {
       // 1. Create Organization with 3 credits and the creator's domain whitelisted
       const [newOrg] = await tx
         .insert(organizations)
@@ -99,7 +102,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
 
   try {
     // 1. Query invite code
-    const invite = await db.query.organizationInvites.findFirst({
+    const invite = await systemDb.query.organizationInvites.findFirst({
       where: eq(organizationInvites.inviteCode, inviteCode),
     });
 
@@ -119,7 +122,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
     // Check invite whitelist first, then fallback to organization allowed domains
     let allowedDomains = invite.allowedDomains;
     if (!allowedDomains || allowedDomains.length === 0) {
-      const org = await db.query.organizations.findFirst({
+      const org = await systemDb.query.organizations.findFirst({
         where: eq(organizations.id, invite.organizationId),
       });
       allowedDomains = org?.allowedDomains || [];
@@ -133,7 +136,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
     }
 
     // Check if user already exists
-    const existingUser = await db.query.users.findFirst({
+    const existingUser = await systemDb.query.users.findFirst({
       where: eq(users.email, email),
     });
 
@@ -142,7 +145,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
     }
 
     // 3. Create User as MEMBER under transaction
-    const token = await db.transaction(async (tx) => {
+    const token = await systemDb.transaction(async (tx) => {
       const salt = await bcrypt.genSalt(10);
       const passwordHash = await bcrypt.hash(password, salt);
 
@@ -187,7 +190,7 @@ router.post("/login", async (req: Request, res: Response) => {
   }
 
   try {
-    const user = await db.query.users.findFirst({
+    const user = await systemDb.query.users.findFirst({
       where: eq(users.email, email),
     });
 
@@ -224,13 +227,17 @@ router.post("/login", async (req: Request, res: Response) => {
  */
 router.get("/profile", authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   const userId = req.user!.id;
+  const orgId = req.user!.organizationId;
   try {
-    const user = await db.query.users.findFirst({
-      where: eq(users.id, userId),
-      with: {
-        organization: true,
-      },
-    });
+    // Tenant context is known here, so this runs under RLS.
+    const user = await withTenant(orgId, (tx) =>
+      tx.query.users.findFirst({
+        where: eq(users.id, userId),
+        with: {
+          organization: true,
+        },
+      })
+    );
 
     if (!user) {
       return res.status(404).json({ error: "User profile not found" });

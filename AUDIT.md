@@ -245,9 +245,11 @@ This is on a live path, not a dead one: `worker.ts:52` simulates failure at roug
 | `ALTER TABLE … ENABLE ROW LEVEL SECURITY` (users, jobs, organization_invites) | No |
 | `tenant_isolation_users` / `_jobs` / `_invites` policies | No |
 
-The indexes are a performance concern. **The RLS omission is a security concern**, and the most consequential item in this audit: tenant isolation currently rests entirely on hand-written `eq(table.organizationId, orgId)` predicates in application code. A single forgotten predicate in a single query is a cross-tenant data leak in a product handling medical images. RLS exists precisely so that this class of mistake fails closed.
+The indexes are a performance concern. **The RLS omission is a security concern**, and was the most consequential item in this audit: tenant isolation rested entirely on hand-written `eq(table.organizationId, orgId)` predicates in application code. A single forgotten predicate in a single query is a cross-tenant data leak in a product handling medical images. RLS exists precisely so that this class of mistake fails closed.
 
-See §2.5 — the specified policies also would not function as written even if applied.
+See §2.5 — the specified policies also would not have functioned as written even if applied.
+
+*Status:* **resolved.** Indexes and the CHECK constraint in migration `0001`; RLS, roles, and policies in `0002`. See "How RLS was implemented" in §7.
 
 ### MEDIUM — the worker writes the database directly, and its SSE broadcasts reach nobody
 
@@ -314,7 +316,7 @@ Against `arch.md`. "Partial" means implemented with a material caveat documented
 | §2 | Organization owns shared credit pool | ✅ | `schema.ts:9-16` |
 | §2 | Roles `ORG_ADMIN` / `MEMBER` | ⚠️ Partial | Enum + `requireRole` exist; enforced only on `/api/invites` |
 | §2 | S3 paths segregated by organization UUID | ✅ | `jobs.ts:99` — `org_id=<uuid>/jobs/<uuid>/raw.png` |
-| §2 | Schema ready for RLS on `organization_id` | ⚠️ Partial | Column present; policies designed but absent from the migration, and would not work as specified — §2.5 |
+| §2 | Schema ready for RLS on `organization_id` | ✅ | Enforced, not merely ready: migration `0002`, `withTenant()` in `src/db/index.ts`, regression test `npm run test:rls` |
 | §3 | First signup creates org + grants `ORG_ADMIN` | ✅ | `auth.ts:41-77` |
 | §3 | Seed exactly 3 trial credits | ✅ | `auth.ts:47`, `schema.ts:12` |
 | §3 | Reusable invite link `/join/inv_<uuid>` | ✅ | `invites.ts:25`, `invites.ts:50` |
@@ -336,7 +338,7 @@ Implementation defects, ordered by unblocking value. Design work is ordered sepa
 | ~~2~~ | ~~Add `GET /api/jobs/:jobId/image/:kind` serving `uploads/`, tenant-scoped~~ | — | **Done.** Tenant-scoped; cross-tenant reads 404, anonymous reads 401 |
 | ~~3~~ | ~~Authenticate the SSE stream by a means `EventSource` can carry~~ | — | **Done.** 60s purpose-scoped stream token; rejected as a Bearer credential |
 | ~~4~~ | ~~Worker reports completion to the API instead of writing the DB; one hub serves clients~~ | — | **Done.** Worker holds no DB credentials; events now reach browser clients |
-| 5 | **Partially done.** Indexes and the `credit_balance >= 0` CHECK shipped in migration `0001`. **RLS is still outstanding** and remains the highest-severity latent risk | Medium | See the note below on why RLS was not bundled |
+| ~~5~~ | ~~Migration adding indexes, the `credit_balance >= 0` CHECK, and working RLS (`SET LOCAL` + `FORCE`)~~ | — | **Done.** Indexes and CHECK in `0001`; RLS in `0002`. Verified by `npm run test:rls` |
 | ~~6~~ | ~~Correct amqplib types (`ChannelModel`) and null guards~~ | — | **Done.** `tsc --noEmit` is clean |
 | 7 | Reaper for abandoned `PENDING`/`PROCESSING` jobs; DLQ | Medium | Stops credit leakage and silent message loss. Report replay is now refused (409), so double-refund is closed |
 | 8 | S3 lifecycle/retention rules; real VIP consumer or remove the routing stub | Medium | Compliance gap, plus VIP jobs currently hang forever |
@@ -352,17 +354,19 @@ cd backend  && npx tsc --noEmit     # 7 errors at 9b53949; 0 after fixes #1 and 
 cd frontend && npx tsc --noEmit     # 10 errors at 9b53949; 0 after the Next.js migration
 ```
 
-### Why RLS was not shipped with the rest of fix #5
+### How RLS was implemented
 
-Enabling RLS is not additive — done partially it takes the system down, and done carelessly it produces the *appearance* of isolation without the substance. Three things must land together:
+Enabling RLS is not additive — done partially it takes the system down, and done carelessly it produces the *appearance* of isolation without the substance. Three things had to land together, and did:
 
-1. **A non-superuser database role.** The app connects as `postgres`, which is a superuser, and **superusers bypass RLS unconditionally** — `FORCE ROW LEVEL SECURITY` closes the table-owner hole but not the superuser one. Policies would be silently inert.
-2. **`SET LOCAL` inside every request transaction.** With a shared `pg.Pool`, a session-level `SET` leaks to whichever request borrows that connection next (§2.5). Every tenant-scoped query therefore has to move inside a transaction that sets the org context first.
-3. **A bypass path for authentication.** `users` carries the policy, but login looks a user up by email *before* any organization context exists. Under RLS that query returns zero rows and nobody can sign in. This needs a separate role or an explicitly exempted code path.
+1. **Non-superuser database roles.** The app previously connected as `postgres`, a superuser, and **superusers bypass RLS unconditionally** — `FORCE ROW LEVEL SECURITY` closes the table-owner hole but not the superuser one, so the policies would have been silently inert. Migration `0002` creates `irismono_app` (no superuser, no `BYPASSRLS`) for runtime and `irismono_auth` (`BYPASSRLS`) for pre-tenant work. `postgres` is now used only for DDL, via `ADMIN_DATABASE_URL`.
+2. **Transaction-scoped context.** `withTenant()` in `src/db/index.ts` opens a transaction and calls `set_config('app.current_organization_id', $1, true)` — `is_local => true`, so the setting dies with the transaction. A session-level `SET` on a pooled connection would leak one tenant's context into the next request that borrows it, which is worse than having no RLS at all. Every tenant-scoped query now runs inside it.
+3. **A pre-tenant path.** Login, registration, and invite redemption identify a row by email or invite code *before* any organization is known; under RLS those queries return zero rows and nobody can sign in. They run on `systemDb` (the `BYPASSRLS` identity), as does the worker's job report, which knows only a job id and is gated by the worker shared secret.
 
-Shipping 1 and 2 without 3 breaks login for every user; shipping 2 without 1 looks correct and protects nothing. It is a coherent unit of work, not a migration.
+`organizations` was added to the policy set even though the specification omitted it — it holds the credit balance, and a query that lost its predicate would otherwise read another tenant's billing state.
 
-**Status update.** Fixes #1, #2, #3, #4, and #6 have since been applied, along with the index and CHECK portion of #5. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+`npm run test:rls` (`src/test-rls.ts`) is the regression test. Every query in it deliberately omits the organization predicate, so it fails loudly if policies are dropped, if the app role regains superuser or `BYPASSRLS`, or if the context stops being applied. Observed: with 4 jobs across 5 organizations, a query with no context returns 0 rows; the same unscoped query inside tenant A's context returns only A's single job; tenant B's set is disjoint; a cross-tenant `UPDATE` matches 0 rows; and a fresh query after commit sees 0, confirming the context does not survive onto the pooled connection.
+
+**Status update.** Fixes #1 through #6 have all been applied. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 

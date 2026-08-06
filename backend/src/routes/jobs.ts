@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { db } from "../db";
+import { systemDb, withTenant } from "../db";
 import { organizations, jobs } from "../db/schema";
 import { eq, and, sql } from "drizzle-orm";
 import {
@@ -99,10 +99,13 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
     return res.status(400).json({ error: "status must be PROCESSING, SUCCESS or FAILED" });
   }
 
+  // The worker knows a job id and nothing else - it has no organization
+  // context to set, so this runs on the RLS-bypassing system identity. It is
+  // gated by the worker shared secret and only ever touches the one job.
   try {
     // Interim progress: no credit implications, no transaction needed.
     if (status === "PROCESSING") {
-      const [updated] = await db
+      const [updated] = await systemDb
         .update(jobs)
         .set({ status: "PROCESSING" })
         .where(and(eq(jobs.id, jobId), eq(jobs.status, "PENDING")))
@@ -122,7 +125,7 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
 
     // Terminal states settle the reserved credit, so they run in a transaction
     // with the job row locked.
-    const outcome = await db.transaction(async (tx) => {
+    const outcome = await systemDb.transaction(async (tx) => {
       const locked = await tx.execute(
         sql`SELECT id, organization_id, status FROM jobs WHERE id = ${jobId} FOR UPDATE`
       );
@@ -205,7 +208,7 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
 
   try {
     // Start transactional credit checking & reservation
-    const result = await db.transaction(async (tx) => {
+    const result = await withTenant(orgId, async (tx) => {
       // a. SELECT FOR UPDATE to lock organization row and prevent overdraft race conditions
       const orgs = await tx.execute(
         sql`SELECT id, credit_balance, allowed_domains FROM organizations WHERE id = ${orgId} FOR UPDATE`
@@ -282,10 +285,12 @@ router.get("/logs", async (req: AuthenticatedRequest, res: Response) => {
   const orgId = req.user!.organizationId;
 
   try {
-    const logs = await db.query.jobs.findMany({
-      where: eq(jobs.organizationId, orgId),
-      orderBy: (jobs, { desc }) => [desc(jobs.createdAt)],
-    });
+    const logs = await withTenant(orgId, (tx) =>
+      tx.query.jobs.findMany({
+        where: eq(jobs.organizationId, orgId),
+        orderBy: (jobs, { desc }) => [desc(jobs.createdAt)],
+      })
+    );
 
     return res.status(200).json({ logs });
   } catch (error) {
@@ -302,12 +307,22 @@ router.post("/:jobId/trigger", async (req: AuthenticatedRequest, res: Response) 
   const orgId = req.user!.organizationId;
 
   try {
-    const job = await db.query.jobs.findFirst({
-      where: and(
-        eq(jobs.id, jobId),
-        eq(jobs.organizationId, orgId)
-      ),
+    const found = await withTenant(orgId, async (tx) => {
+      const job = await tx.query.jobs.findFirst({
+        where: and(
+          eq(jobs.id, jobId),
+          eq(jobs.organizationId, orgId)
+        ),
+      });
+
+      const org = await tx.query.organizations.findFirst({
+        where: eq(organizations.id, orgId),
+      });
+
+      return { job, org };
     });
+
+    const { job, org } = found;
 
     if (!job) {
       return res.status(404).json({ error: "Job record not found." });
@@ -318,10 +333,6 @@ router.post("/:jobId/trigger", async (req: AuthenticatedRequest, res: Response) 
     }
 
     // Determine target queue (standard vs VIP infrastructure routing)
-    const org = await db.query.organizations.findFirst({
-      where: eq(organizations.id, orgId),
-    });
-
     const isVip = org?.name.toLowerCase().includes("vip") || false;
     const queueName = isVip ? `queue-vip-${orgId}` : "queue-standard-jobs";
 
@@ -361,9 +372,11 @@ router.get("/:jobId/image/:kind", async (req: AuthenticatedRequest, res: Respons
   }
 
   try {
-    const job = await db.query.jobs.findFirst({
-      where: and(eq(jobs.id, jobId), eq(jobs.organizationId, orgId)),
-    });
+    const job = await withTenant(orgId, (tx) =>
+      tx.query.jobs.findFirst({
+        where: and(eq(jobs.id, jobId), eq(jobs.organizationId, orgId)),
+      })
+    );
 
     if (!job) {
       return res.status(404).json({ error: "Job record not found." });

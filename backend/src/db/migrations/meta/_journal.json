@@ -15,6 +15,13 @@
       "when": 1786000000000,
       "tag": "0001_indexes_and_credit_floor",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786000100000,
+      "tag": "0002_row_level_security",
+      "breakpoints": true
     }
   ]
 }

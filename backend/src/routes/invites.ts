@@ -1,5 +1,5 @@
 import { Router as ExpressRouter, Response } from "express";
-import { db } from "../db";
+import { withTenant } from "../db";
 import { organizations, organizationInvites } from "../db/schema";
 import { eq, and } from "drizzle-orm";
 import { authenticateJWT, AuthenticatedRequest, requireRole } from "../middleware/auth";
@@ -24,26 +24,30 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
     const inviteCode = `inv_${randomUUID()}`;
     const expiresAt = expiresDays ? new Date(Date.now() + expiresDays * 24 * 60 * 60 * 1000) : null;
 
-    // Use organization allowed domains as default if none specified
-    let finalDomains = allowedDomains;
-    if (!finalDomains || !Array.isArray(finalDomains)) {
-      const org = await db.query.organizations.findFirst({
-        where: eq(organizations.id, orgId),
-      });
-      finalDomains = org?.allowedDomains || [];
-    }
+    const newInvite = await withTenant(orgId, async (tx) => {
+      // Use organization allowed domains as default if none specified
+      let finalDomains = allowedDomains;
+      if (!finalDomains || !Array.isArray(finalDomains)) {
+        const org = await tx.query.organizations.findFirst({
+          where: eq(organizations.id, orgId),
+        });
+        finalDomains = org?.allowedDomains || [];
+      }
 
-    const [newInvite] = await db
-      .insert(organizationInvites)
-      .values({
-        organizationId: orgId,
-        inviteCode,
-        allowedDomains: finalDomains,
-        isActive: true,
-        createdBy: userId,
-        expiresAt,
-      })
-      .returning();
+      const [created] = await tx
+        .insert(organizationInvites)
+        .values({
+          organizationId: orgId,
+          inviteCode,
+          allowedDomains: finalDomains,
+          isActive: true,
+          createdBy: userId,
+          expiresAt,
+        })
+        .returning();
+
+      return created;
+    });
 
     return res.status(201).json({
       inviteLink: `/join/${newInvite.inviteCode}`,
@@ -65,24 +69,32 @@ router.patch("/:inviteId/toggle", async (req: AuthenticatedRequest, res: Respons
   const orgId = req.user!.organizationId;
 
   try {
-    const invite = await db.query.organizationInvites.findFirst({
-      where: and(
-        eq(organizationInvites.id, inviteId),
-        eq(organizationInvites.organizationId, orgId)
-      ),
+    const updatedInvite = await withTenant(orgId, async (tx) => {
+      const invite = await tx.query.organizationInvites.findFirst({
+        where: and(
+          eq(organizationInvites.id, inviteId),
+          eq(organizationInvites.organizationId, orgId)
+        ),
+      });
+
+      if (!invite) {
+        return null;
+      }
+
+      const [updated] = await tx
+        .update(organizationInvites)
+        .set({
+          isActive: !invite.isActive,
+        })
+        .where(eq(organizationInvites.id, inviteId))
+        .returning();
+
+      return updated;
     });
 
-    if (!invite) {
+    if (!updatedInvite) {
       return res.status(404).json({ error: "Invite link not found" });
     }
-
-    const [updatedInvite] = await db
-      .update(organizationInvites)
-      .set({
-        isActive: !invite.isActive,
-      })
-      .where(eq(organizationInvites.id, inviteId))
-      .returning();
 
     return res.status(200).json({
       message: `Invite link ${updatedInvite.isActive ? "activated" : "deactivated"} successfully.`,
@@ -114,42 +126,53 @@ router.post("/domains", async (req: AuthenticatedRequest, res: Response) => {
   const cleanDomain = domain.toLowerCase().trim();
 
   try {
-    const org = await db.query.organizations.findFirst({
-      where: eq(organizations.id, orgId),
+    const outcome = await withTenant(orgId, async (tx) => {
+      const org = await tx.query.organizations.findFirst({
+        where: eq(organizations.id, orgId),
+      });
+
+      if (!org) {
+        return { error: "NOT_FOUND" as const };
+      }
+
+      let updatedDomains = [...org.allowedDomains];
+
+      if (action === "add") {
+        if (!updatedDomains.includes(cleanDomain)) {
+          updatedDomains.push(cleanDomain);
+        }
+      } else if (action === "remove") {
+        // Rule: Whitelist must maintain AT LEAST one domain pattern
+        if (updatedDomains.length <= 1) {
+          return { error: "LAST_DOMAIN" as const };
+        }
+        updatedDomains = updatedDomains.filter((d) => d !== cleanDomain);
+      }
+
+      const [updatedOrg] = await tx
+        .update(organizations)
+        .set({
+          allowedDomains: updatedDomains,
+          updatedAt: new Date(),
+        })
+        .where(eq(organizations.id, orgId))
+        .returning();
+
+      return { allowedDomains: updatedOrg.allowedDomains };
     });
 
-    if (!org) {
-      return res.status(404).json({ error: "Organization not found" });
-    }
-
-    let updatedDomains = [...org.allowedDomains];
-
-    if (action === "add") {
-      if (!updatedDomains.includes(cleanDomain)) {
-        updatedDomains.push(cleanDomain);
+    if ("error" in outcome) {
+      if (outcome.error === "NOT_FOUND") {
+        return res.status(404).json({ error: "Organization not found" });
       }
-    } else if (action === "remove") {
-      // Rule: Whitelist must maintain AT LEAST one domain pattern
-      if (updatedDomains.length <= 1) {
-        return res.status(400).json({
-          error: "Action denied. Organization whitelist must contain at least one domain pattern."
-        });
-      }
-      updatedDomains = updatedDomains.filter((d) => d !== cleanDomain);
+      return res.status(400).json({
+        error: "Action denied. Organization whitelist must contain at least one domain pattern."
+      });
     }
-
-    const [updatedOrg] = await db
-      .update(organizations)
-      .set({
-        allowedDomains: updatedDomains,
-        updatedAt: new Date(),
-      })
-      .where(eq(organizations.id, orgId))
-      .returning();
 
     return res.status(200).json({
       message: "Allowed domains updated successfully",
-      allowedDomains: updatedOrg.allowedDomains
+      allowedDomains: outcome.allowedDomains
     });
 
   } catch (error) {
@@ -165,10 +188,12 @@ router.post("/domains", async (req: AuthenticatedRequest, res: Response) => {
 router.get("/", async (req: AuthenticatedRequest, res: Response) => {
   const orgId = req.user!.organizationId;
   try {
-    const list = await db.query.organizationInvites.findMany({
-      where: eq(organizationInvites.organizationId, orgId),
-      orderBy: (inv, { desc }) => [desc(inv.createdAt)],
-    });
+    const list = await withTenant(orgId, (tx) =>
+      tx.query.organizationInvites.findMany({
+        where: eq(organizationInvites.organizationId, orgId),
+        orderBy: (inv, { desc }) => [desc(inv.createdAt)],
+      })
+    );
     return res.status(200).json({ invites: list });
   } catch (error) {
     return res.status(500).json({ error: "Failed to fetch organization invites list" });
@@ -182,9 +207,11 @@ router.get("/", async (req: AuthenticatedRequest, res: Response) => {
 router.get("/domains/list", async (req: AuthenticatedRequest, res: Response) => {
   const orgId = req.user!.organizationId;
   try {
-    const org = await db.query.organizations.findFirst({
-      where: eq(organizations.id, orgId),
-    });
+    const org = await withTenant(orgId, (tx) =>
+      tx.query.organizations.findFirst({
+        where: eq(organizations.id, orgId),
+      })
+    );
     return res.status(200).json({ allowedDomains: org?.allowedDomains || [] });
   } catch (error) {
     return res.status(500).json({ error: "Failed to fetch organization whitelist domains list" });
