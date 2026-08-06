@@ -1,0 +1,110 @@
+# Walkthrough - General Backend API
+
+This walkthrough documents the files created, the verification steps taken, and the results of running the multi-tenant image masking backend service locally.
+
+---
+
+## 1. Directory Structure
+
+All files have been written inside the `backend` directory under the workspace:
+
+* [package.json](file:///d:/IrisMono/backend/package.json) - Express, Drizzle ORM, node-postgres, and RabbitMQ dependencies.
+* [tsconfig.json](file:///d:/IrisMono/backend/tsconfig.json) - TypeScript compiler setup.
+* [docker-compose.yml](file:///d:/IrisMono/backend/docker-compose.yml) - Local RabbitMQ and PostgreSQL container definitions.
+* [.env](file:///d:/IrisMono/backend/.env) - Local development credentials mapping to RabbitMQ port 5672 and the host-installed PostgreSQL port 5432.
+* **Database & Migration Layer:**
+  * [schema.ts](file:///d:/IrisMono/backend/src/db/schema.ts) - Drizzle mapping for organizations, users, invites, and jobs.
+  * [index.ts](file:///d:/IrisMono/backend/src/db/index.ts) - Pool configurations.
+  * [migrate.ts](file:///d:/IrisMono/backend/src/db/migrate.ts) - CLI migration execution.
+* **Utility & Middleware:**
+  * [domain.ts](file:///d:/IrisMono/backend/src/utils/domain.ts) - Wildcard wildcard-subdomain whitelist matching.
+  * [auth.ts](file:///d:/IrisMono/backend/src/middleware/auth.ts) - JWT bearer extraction.
+* **Communication & Queue Orchestration:**
+  * [index.ts](file:///d:/IrisMono/backend/src/queue/index.ts) - amqplib assertions and queue publishers.
+  * [index.ts](file:///d:/IrisMono/backend/src/sse/index.ts) - SSE subscription connection map and ping heartbeats.
+* **Express Routers:**
+  * [auth.ts](file:///d:/IrisMono/backend/src/routes/auth.ts) - Signup, invite-joining, and logins.
+  * [jobs.ts](file:///d:/IrisMono/backend/src/routes/jobs.ts) - S3 URL presigning, atomic credit checks, queuing, and audit logs.
+  * [invites.ts](file:///d:/IrisMono/backend/src/routes/invites.ts) - Allowed domains arrays, toggling, and revocations.
+* **Entry Points:**
+  * [index.ts](file:///d:/IrisMono/backend/src/index.ts) - API entry point.
+  * [worker.ts](file:///d:/IrisMono/backend/src/worker.ts) - ML GPU worker simulator.
+* **Verification Runner:**
+  * [test-flow.ts](file:///d:/IrisMono/backend/src/test-flow.ts) - Complete end-to-end integration scenario execution.
+
+---
+
+## 2. Verification Outcomes
+
+An end-to-end integration test was executed. Below is the step-by-step console output showing the full cycle:
+
+```text
+=== STARTING ARCHITECTURAL FLOW INTEGRATION TEST ===
+
+1. Registering first creator for St. Jude Children Hospital...
+-> Admin registration successful. Token obtained.
+
+2. Checking initial organization credit balance (expecting 3)...
+-> Log count: 0
+
+3. Generating reusable invite link for organization...
+-> Invite generated: /join/inv_4afecfa3-7546-40ff-b38a-f4554a584b30
+
+4. Attempting to register user with Gmail address via invite link...
+-> Blocked successfully. Error message: [HTTP 403] {"error":"Registration denied. Your email domain is not authorized for this organization. Whitelist includes: stjude.org"}
+
+5. Registering member with whitelisted subdomain (research.stjude.org) email...
+-> Member registration successful. Token obtained.
+
+6. Requesting upload URL & reserving credit...
+-> Reserved Job ID: 15c325f6-f023-4024-ba6c-6ed2b37cf54a
+-> Upload URL: http://localhost:3000/api/jobs/mock-upload/15c325f6-f023-4024-ba6c-6ed2b37cf54a
+
+7. Uploading raw image file direct to mock storage path...
+-> File upload completed.
+
+8. Triggering GPU worker queue execution...
+-> Dispatched status: Job successfully queued for processing (Queue: queue-standard-jobs)
+
+9. Waiting 6 seconds for GPU simulation worker to complete the job...
+
+10. Fetching logs and final job status...
+-> Final Job Status: SUCCESS
+-> Result Mask S3 path: org_id=59968d0f-04c5-4dc5-a50c-b11fc6f81da6/jobs/15c325f6-f023-4024-ba6c-6ed2b37cf54a/mask.png
+
+11. Testing invite link panic/revocation button...
+-> Invite Active Status: false
+
+12. Attempting to register via revoked invite link...
+-> Blocked successfully. Error message: [HTTP 410] {"error":"This invite link has been revoked or deactivated"}
+
+=== INTEGRATION TEST COMPLETED SUCCESSFULLY ===
+```
+
+---
+
+## 3. Running Locally
+
+If you need to run the servers locally, you can use the following scripts:
+
+### Prerequisites:
+1. Make sure your local PostgreSQL is running.
+2. Run RabbitMQ in docker (already spun up and running):
+   ```bash
+   docker compose up -d rabbitmq
+   ```
+
+### Start API Server:
+```bash
+npm run dev
+```
+
+### Start GPU Simulation Consumer Worker:
+```bash
+npm run worker:dev
+```
+
+### Run Verification Test Suite:
+```bash
+npx tsx src/test-flow.ts
+```
