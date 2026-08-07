@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import { systemDb } from "./db";
 import { sseHub } from "./sse";
+import { refundCredit } from "./credits";
 
 /**
  * Reclaims credits from jobs that will never finish.
@@ -55,23 +56,17 @@ async function expire(
     const rows = stale.rows as unknown as ReapedRow[];
     if (rows.length === 0) return [];
 
-    // Refund one credit per reclaimed job, grouped so each organization takes a
-    // single locked update rather than one per job.
-    const perOrg = new Map<string, number>();
+    // One refund per reclaimed job, each recorded in the ledger. refundCredit
+    // is a no-op if that job was already refunded, so a sweep that overlaps a
+    // worker's report cannot return the credit twice.
+    const refunded: ReapedRow[] = [];
     for (const row of rows) {
-      perOrg.set(row.organization_id, (perOrg.get(row.organization_id) ?? 0) + 1);
+      if (await refundCredit(tx, row.organization_id, row.id, reason)) {
+        refunded.push(row);
+      }
     }
 
-    for (const [orgId, count] of perOrg) {
-      await tx.execute(sql`
-        UPDATE organizations
-           SET credit_balance = credit_balance + ${count},
-               updated_at = NOW()
-         WHERE id = ${orgId}
-      `);
-    }
-
-    return rows;
+    return refunded;
   });
 }
 

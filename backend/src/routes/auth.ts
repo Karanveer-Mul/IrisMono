@@ -9,9 +9,13 @@ import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
 import { isEmailDomainAllowed, getEmailDomain } from "../utils/domain";
 import { authenticateJWT, AuthenticatedRequest, issueStreamToken } from "../middleware/auth";
+import { grantCredits } from "../credits";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-change-in-production";
+
+/** Seeded to a new workspace on creation (arch.md section 3). */
+const TRIAL_CREDITS = 3;
 
 /**
  * 1. First-In Creator Signup
@@ -42,15 +46,20 @@ router.post("/register", async (req: Request, res: Response) => {
 
     // Start database transaction
     const token = await systemDb.transaction(async (tx) => {
-      // 1. Create Organization with 3 credits and the creator's domain whitelisted
+      // 1. Create Organization with the creator's domain whitelisted. The
+      // balance starts at zero and the trial credits arrive as a ledger entry
+      // below, so every credit this organization ever holds has a recorded
+      // origin.
       const [newOrg] = await tx
         .insert(organizations)
         .values({
           name: orgName,
-          creditBalance: 3,
+          creditBalance: 0,
           allowedDomains: [creatorDomain],
         })
         .returning();
+
+      await grantCredits(tx, newOrg.id, TRIAL_CREDITS, "TRIAL_GRANT", "New workspace trial credits");
 
       // 2. Hash Password
       const salt = await bcrypt.genSalt(10);

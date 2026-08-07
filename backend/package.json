@@ -12,7 +12,8 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "test:flow": "tsx src/test-flow.ts",
     "test:rls": "tsx src/test-rls.ts",
-    "test:lifecycle": "tsx src/test-lifecycle.ts"
+    "test:lifecycle": "tsx src/test-lifecycle.ts",
+    "test:credits": "tsx src/test-credits.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

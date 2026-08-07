@@ -13,6 +13,7 @@ import { publishJob, QUEUES } from "../queue";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
+import { reserveCredit, refundCredit, InsufficientCredits } from "../credits";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -162,10 +163,9 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
           })
           .where(eq(jobs.id, jobId));
 
-        // Reservation is released only on failure.
-        await tx.execute(
-          sql`UPDATE organizations SET credit_balance = credit_balance + 1, updated_at = NOW() WHERE id = ${row.organization_id}`
-        );
+        // Reservation is released only on failure. Idempotent: a replayed
+        // report cannot refund twice, independently of the status guard above.
+        await refundCredit(tx, row.organization_id, jobId, "Refunded after job failure");
       }
 
       return { orgId: row.organization_id };
@@ -211,29 +211,12 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
   try {
     // Start transactional credit checking & reservation
     const result = await withTenant(orgId, async (tx) => {
-      // a. SELECT FOR UPDATE to lock organization row and prevent overdraft race conditions
-      const orgs = await tx.execute(
-        sql`SELECT id, credit_balance, allowed_domains FROM organizations WHERE id = ${orgId} FOR UPDATE`
-      );
-
-      if (orgs.rows.length === 0) {
-        throw new Error("Organization not found");
-      }
-
-      const creditBalance = orgs.rows[0].credit_balance as number;
-      if (creditBalance <= 0) {
-        throw new Error("INSUFFICIENT_CREDITS");
-      }
-
-      // b. Decrement credit balance immediately (Reservation)
-      await tx.execute(
-        sql`UPDATE organizations SET credit_balance = credit_balance - 1, updated_at = NOW() WHERE id = ${orgId}`
-      );
-
-      // c. Insert job record in PENDING state
       const jobId = randomUUID();
       const s3Key = `org_id=${orgId}/jobs/${jobId}/raw.png`;
 
+      // The job row is written first so the ledger's job_id foreign key
+      // resolves; the reservation below still holds the organization lock for
+      // the rest of the transaction, so concurrent spenders remain serialized.
       await tx
         .insert(jobs)
         .values({
@@ -244,6 +227,10 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
           rawImageS3Key: s3Key,
         })
         .returning();
+
+      // Locks the organization row, writes the ledger entry, and decrements the
+      // materialized balance. Throws InsufficientCredits if there is none left.
+      await reserveCredit(tx, orgId, jobId);
 
       return { jobId, s3Key };
     });
@@ -271,7 +258,7 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
     });
 
   } catch (error: any) {
-    if (error.message === "INSUFFICIENT_CREDITS") {
+    if (error instanceof InsufficientCredits) {
       return res.status(402).json({ error: "Insufficient organization credits remaining to start a new job." });
     }
     console.error("Queue job request error:", error);

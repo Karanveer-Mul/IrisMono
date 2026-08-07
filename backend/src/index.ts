@@ -3,6 +3,7 @@ import * as dotenv from "dotenv";
 import authRouter from "./routes/auth";
 import jobsRouter from "./routes/jobs";
 import invitesRouter from "./routes/invites";
+import creditsRouter from "./routes/credits";
 import { initQueue } from "./queue";
 import { startReaper } from "./reaper";
 import { startRetentionSweeper } from "./retention";
@@ -19,6 +20,7 @@ app.use(express.json());
 app.use("/api/auth", authRouter);
 app.use("/api/jobs", jobsRouter);
 app.use("/api/invites", invitesRouter);
+app.use("/api/credits", creditsRouter);
 
 // Health check endpoint
 app.get("/health", (req, res) => {

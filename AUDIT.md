@@ -53,6 +53,8 @@ These are problems with the *design*, not the code. They would survive fixing ev
 
 **Recommendation:** append-only `credit_transactions (id, organization_id, job_id, delta, reason, created_at)` with a unique constraint on `(job_id, reason)`. Balance is then derived, or materialized on `organizations` and reconcilable against the ledger. This makes refunds idempotent for free — the second attempt violates the unique constraint and is a no-op.
 
+*Status:* **resolved.** Implemented as recommended — see "Credit ledger" in §7.
+
 ### 2.2 Privilege inversion — the GPU worker writes the billing table
 
 `worker.ts:67-132` holds full database credentials and directly mutates `organizations.credit_balance`. GPU workers are the least-trusted tier in this architecture: most horizontally scaled, most likely to run third-party model code, most likely to be preempted or run on spot capacity. Giving that tier write access to billing state is backwards.
@@ -358,6 +360,7 @@ cd backend
 npm run test:flow        # end-to-end product flow
 npm run test:rls         # tenant isolation, with predicates deliberately omitted
 npm run test:lifecycle   # reaper, dead-lettering, tier routing
+npm run test:credits     # ledger integrity, refund idempotency, reconciliation
 ```
 
 ### How RLS was implemented
@@ -384,7 +387,19 @@ VIP routing was a stub that shipped: it keyed off `org.name.includes("vip")`, an
 
 `npm run test:lifecycle` covers all of it: a fresh job is left alone, an aged `PENDING` and an aged `PROCESSING` are both expired with exactly one credit returned, a second sweep does not double-refund, an unprocessable message reaches the DLQ, and a VIP tenant's job lands on the VIP queue.
 
-**Status update.** All eight fixes have been applied. Four suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+### Credit ledger (design item §2.1)
+
+Migration `0004` adds append-only `credit_transactions (organization_id, job_id, delta, reason, note, created_at)`. `organizations.credit_balance` survives as a materialized total rather than the source of truth, because the reservation path needs `SELECT ... FOR UPDATE` on a single row to serialize concurrent spenders — summing the ledger under contention would need a heavier locking strategy for no benefit. The two move together inside one transaction, and `reconcile()` in `src/credits.ts` proves they agree.
+
+The important part is the partial unique index on `(job_id, reason) WHERE job_id IS NOT NULL`. **Refund idempotency is now structural**: a replayed worker report or a reaper sweep overlapping a worker's own report hits a database constraint instead of moving the balance a second time. Call sites no longer have to remember — `refundCredit()` returns whether it actually refunded, and callers that care (the reaper's count) use that.
+
+`credit_balance` previously defaulted to 3, which would have created credits with no entry behind them. New organizations now start at zero and receive their trial credits as a recorded `TRIAL_GRANT`, so **every credit in the system has a traceable origin**. Existing balances were seeded with a `BACKFILL` row so they reconcile from day one — 13 organizations, 30 credits, zero discrepancies at migration time.
+
+All movement funnels through `src/credits.ts` (`reserveCredit`, `refundCredit`, `grantCredits`), and `GET /api/credits` exposes balance plus history to the tenant, which is the audit trail `arch.md` asks for and previously did not exist. The table carries the same RLS posture as every other tenant table.
+
+`npm run test:credits` asserts the whole invariant: the trial grant is recorded rather than defaulted, a reservation links to its job, a failure refunds exactly once, a replayed refund returns false and writes nothing, a refused overdraft leaves no ledger row, entries sum to the stored balance, the endpoint agrees with the database, history does not leak across tenants, and every organization in the database reconciles.
+
+**Status update.** All eight defect fixes have been applied, plus the credit ledger from the design critique. Five suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 
