@@ -4,6 +4,8 @@ import authRouter from "./routes/auth";
 import jobsRouter from "./routes/jobs";
 import invitesRouter from "./routes/invites";
 import { initQueue } from "./queue";
+import { startReaper } from "./reaper";
+import { startRetentionSweeper } from "./retention";
 
 dotenv.config();
 
@@ -29,6 +31,11 @@ async function startServer() {
   
   // Initialize RabbitMQ connection
   await initQueue();
+
+  // Background maintenance: reclaim credits from jobs that will never finish,
+  // and expire stored images past the retention window.
+  startReaper();
+  startRetentionSweeper();
 
   app.listen(PORT, () => {
     console.log(`Backend server running on http://localhost:${PORT}`);

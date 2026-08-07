@@ -2,14 +2,30 @@ import * as amqp from "amqplib";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
+import { assertTopology, QUEUES } from "./queue";
 
 dotenv.config();
 
 const AMQP_URL = process.env.AMQP_URL || "amqp://guest:guest@localhost:5672";
-const QUEUE_STANDARD = "queue-standard-jobs";
 
 const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.WORKER_SECRET || "local-dev-worker-secret";
+
+/**
+ * Which tier queues this worker serves. A standard pool consumes the standard
+ * queue; a dedicated pool for enterprise tenants is started with
+ * WORKER_QUEUES=queue-vip-jobs and given its own GPU capacity.
+ */
+const CONSUMED_QUEUES = (process.env.WORKER_QUEUES || QUEUES.STANDARD)
+  .split(",")
+  .map((q) => q.trim())
+  .filter(Boolean);
+
+/** In-process retries before a message is dead-lettered. */
+const REPORT_ATTEMPTS = Number(process.env.WORKER_REPORT_ATTEMPTS || 3);
+const REPORT_RETRY_DELAY_MS = Number(process.env.WORKER_REPORT_RETRY_DELAY_MS || 2000);
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Report a job outcome to the API.
@@ -24,6 +40,9 @@ class ReportError extends Error {
     super(message);
   }
 }
+
+/** The model ran and did not produce a mask. A real outcome, not an error. */
+class ModelFailure extends Error {}
 
 async function reportJobStatus(
   jobId: string,
@@ -54,6 +73,41 @@ async function reportJobStatus(
   }
 }
 
+/**
+ * Reports with bounded retries.
+ *
+ * Only transient conditions are retried. A 4xx is the API's considered answer -
+ * a 409 means someone else already settled the job, and repeating the call will
+ * never change that - so those surface immediately to the caller.
+ */
+async function reportWithRetry(
+  jobId: string,
+  body: Parameters<typeof reportJobStatus>[1]
+) {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= REPORT_ATTEMPTS; attempt++) {
+    try {
+      return await reportJobStatus(jobId, body);
+    } catch (err) {
+      lastError = err;
+
+      const status = err instanceof ReportError ? err.httpStatus : null;
+      const isTransient = status === null || status >= 500;
+      if (!isTransient || attempt === REPORT_ATTEMPTS) {
+        throw err;
+      }
+
+      console.warn(
+        `[Worker] Report attempt ${attempt}/${REPORT_ATTEMPTS} for job ${jobId} failed; retrying...`
+      );
+      await sleep(REPORT_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError;
+}
+
 async function startWorker() {
   console.log("Starting GPU simulation worker queue consumer...");
 
@@ -61,94 +115,108 @@ async function startWorker() {
     const connection = await amqp.connect(AMQP_URL);
     const channel = await connection.createChannel();
 
-    // Ensure standard queue is asserted
-    await channel.assertQueue(QUEUE_STANDARD, { durable: true });
+    // Declare the exchange, tier queues, and their dead-letter queues.
+    await assertTopology(channel);
     // Prefetch 1 message to simulate concurrency control per worker
     channel.prefetch(1);
 
-    console.log(`Worker listening on queue '${QUEUE_STANDARD}'`);
+    console.log(`Worker listening on: ${CONSUMED_QUEUES.join(", ")}`);
 
-    channel.consume(QUEUE_STANDARD, async (msg) => {
-      if (!msg) return;
-
-      const payload = JSON.parse(msg.content.toString());
-      const { jobId, orgId } = payload;
-
-      console.log(`[Worker] Received job ${jobId} for org ${orgId}`);
-
-      try {
-        // 1. Claim the job. A 409 means it is no longer PENDING - another
-        // delivery already owns it, so drop this copy rather than racing.
-        try {
-          await reportJobStatus(jobId, { status: "PROCESSING" });
-        } catch (claimErr) {
-          if (claimErr instanceof ReportError && claimErr.httpStatus === 409) {
-            console.warn(`[Worker] Job ${jobId} is not PENDING; discarding duplicate delivery.`);
-            channel.ack(msg);
-            return;
-          }
-          throw claimErr;
-        }
-
-        // 2. Simulate heavy GPU processing (e.g. 5 seconds)
-        console.log(`[Worker] Running machine learning mask model on GPU for job ${jobId}...`);
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-
-        // 3. Simulated model outcomes (90% success, 10% failure simulation)
-        const isSuccess = Math.random() > 0.1;
-
-        if (!isSuccess) {
-          throw new Error("GPU out of memory or ML model threshold assertion failed.");
-        }
-
-        // Handle mock S3 file writes locally
-        const uploadsDir = path.join(__dirname, "../../uploads");
-        const rawPath = path.join(uploadsDir, `${jobId}-raw.png`);
-        const maskPath = path.join(uploadsDir, `${jobId}-mask.png`);
-
-        if (fs.existsSync(rawPath)) {
-          // Generate mock mask: just copy raw image or write a blank dummy
-          fs.copyFileSync(rawPath, maskPath);
-          console.log(`[Worker] Generated mask file locally at: ${maskPath}`);
-        }
-
-        await reportJobStatus(jobId, {
-          status: "SUCCESS",
-          maskImageS3Key: `org_id=${orgId}/jobs/${jobId}/mask.png`,
-        });
-
-        console.log(`[Worker] Job ${jobId} completed successfully.`);
-        channel.ack(msg);
-
-      } catch (error: any) {
-        console.error(`[Worker] Failed job ${jobId}:`, error.message);
-
-        try {
-          await reportJobStatus(jobId, {
-            status: "FAILED",
-            errorMessage: error.message || "Internal ML worker failure",
-          });
-          console.log(`[Worker] Job ${jobId} reported as FAILED. Credit refunded by API.`);
-
-          // The outcome is recorded, so the message is done.
-          channel.ack(msg);
-
-        } catch (reportErr) {
-          // The outcome was NOT recorded. Acking here would strand the job in
-          // PROCESSING with its credit still reserved and nothing left to retry
-          // it, so requeue instead and let another delivery settle it.
-          console.error(`[Worker] Could not report outcome for job ${jobId}:`, reportErr);
-
-          // Back off before requeueing: without a dead-letter queue (AUDIT fix
-          // #7) an immediate nack spins hot while the API is unreachable.
-          setTimeout(() => channel.nack(msg, false, true), 5000);
-        }
-      }
-    });
+    for (const queue of CONSUMED_QUEUES) {
+      await channel.consume(queue, (msg) => handleMessage(channel, msg));
+    }
 
   } catch (err) {
     console.error("Worker connection failed to RabbitMQ:", err);
     setTimeout(startWorker, 5000);
+  }
+}
+
+async function handleMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage | null) {
+  if (!msg) return;
+
+  let jobId: string | undefined;
+
+  try {
+    const payload = JSON.parse(msg.content.toString());
+    jobId = payload.jobId;
+    const orgId = payload.orgId;
+
+    if (!jobId) {
+      throw new Error("Message has no jobId");
+    }
+
+    console.log(`[Worker] Received job ${jobId} for org ${orgId}`);
+
+    // 1. Claim the job. A 409 means it is no longer PENDING - another delivery
+    // already owns it, so drop this copy rather than racing.
+    try {
+      await reportWithRetry(jobId, { status: "PROCESSING" });
+    } catch (claimErr) {
+      if (claimErr instanceof ReportError && claimErr.httpStatus === 409) {
+        console.warn(`[Worker] Job ${jobId} is not PENDING; discarding duplicate delivery.`);
+        channel.ack(msg);
+        return;
+      }
+      throw claimErr;
+    }
+
+    // 2. Simulate heavy GPU processing (e.g. 5 seconds)
+    console.log(`[Worker] Running machine learning mask model on GPU for job ${jobId}...`);
+    await sleep(5000);
+
+    // 3. Simulated model outcomes (90% success, 10% failure simulation)
+    const isSuccess = Math.random() > 0.1;
+
+    if (!isSuccess) {
+      throw new ModelFailure("GPU out of memory or ML model threshold assertion failed.");
+    }
+
+    // Handle mock S3 file writes locally
+    const uploadsDir = path.join(__dirname, "../../uploads");
+    const rawPath = path.join(uploadsDir, `${jobId}-raw.png`);
+    const maskPath = path.join(uploadsDir, `${jobId}-mask.png`);
+
+    if (fs.existsSync(rawPath)) {
+      // Generate mock mask: just copy raw image or write a blank dummy
+      fs.copyFileSync(rawPath, maskPath);
+      console.log(`[Worker] Generated mask file locally at: ${maskPath}`);
+    }
+
+    await reportWithRetry(jobId, {
+      status: "SUCCESS",
+      maskImageS3Key: `org_id=${orgId}/jobs/${jobId}/mask.png`,
+    });
+
+    console.log(`[Worker] Job ${jobId} completed successfully.`);
+    channel.ack(msg);
+
+  } catch (error: any) {
+    console.error(`[Worker] Failed job ${jobId ?? "<unparseable>"}:`, error.message);
+
+    // A model failure is a real outcome and must be recorded so the credit is
+    // returned. Anything else (unreachable API, malformed message) means we
+    // could not establish an outcome at all.
+    if (jobId && error instanceof ModelFailure) {
+      try {
+        await reportWithRetry(jobId, {
+          status: "FAILED",
+          errorMessage: error.message,
+        });
+        console.log(`[Worker] Job ${jobId} reported as FAILED. Credit refunded by API.`);
+        channel.ack(msg);
+        return;
+      } catch (reportErr: any) {
+        console.error(`[Worker] Could not report failure for job ${jobId}:`, reportErr.message);
+      }
+    }
+
+    // Outcome not recorded. Do not requeue: retries already happened in-process,
+    // and an endless redelivery loop would spin hot while the API is down.
+    // Dead-letter it instead, so the message survives for inspection and the
+    // reaper reclaims the credit once the job ages out.
+    console.error(`[Worker] Dead-lettering job ${jobId ?? "<unparseable>"}.`);
+    channel.nack(msg, false, false);
   }
 }
 

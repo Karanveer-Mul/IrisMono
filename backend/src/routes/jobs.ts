@@ -9,7 +9,7 @@ import {
   AuthenticatedRequest,
 } from "../middleware/auth";
 import { sseHub } from "../sse";
-import { publishJob } from "../queue";
+import { publishJob, QUEUES } from "../queue";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
@@ -107,7 +107,9 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
     if (status === "PROCESSING") {
       const [updated] = await systemDb
         .update(jobs)
-        .set({ status: "PROCESSING" })
+        // startedAt gives the reaper a clock for execution time, separate from
+        // how long the reservation has existed.
+        .set({ status: "PROCESSING", startedAt: new Date() })
         .where(and(eq(jobs.id, jobId), eq(jobs.status, "PENDING")))
         .returning();
 
@@ -332,9 +334,9 @@ router.post("/:jobId/trigger", async (req: AuthenticatedRequest, res: Response) 
       return res.status(400).json({ error: `Job has already been dispatched. Current status: ${job.status}` });
     }
 
-    // Determine target queue (standard vs VIP infrastructure routing)
-    const isVip = org?.name.toLowerCase().includes("vip") || false;
-    const queueName = isVip ? `queue-vip-${orgId}` : "queue-standard-jobs";
+    // Determine target queue from the organization's infrastructure tier.
+    // One queue per tier, not per tenant - see src/queue/index.ts.
+    const queueName = org?.infrastructureTier === "VIP" ? QUEUES.VIP : QUEUES.STANDARD;
 
     // Publish task message to RabbitMQ queue
     await publishJob(queueName, {

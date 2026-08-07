@@ -31,13 +31,18 @@ async function request(path: string, method = "GET", body: any = null, token: st
 async function runTests() {
   console.log("=== STARTING ARCHITECTURAL FLOW INTEGRATION TEST ===\n");
 
+  // Unique per run: the flow registers accounts, and re-registering a fixed
+  // address fails with 409. Without this the suite only passes against an
+  // empty database.
+  const stamp = Date.now();
+
   try {
     // 1. Register new organization (First-In Creator)
     console.log("1. Registering first creator for St. Jude Children Hospital...");
     const adminReg = await request("/auth/register", "POST", {
-      email: "director@stjude.org",
+      email: `director.${stamp}@stjude.org`,
       password: "secure_password_123",
-      orgName: "St. Jude Hospital"
+      orgName: `St. Jude Hospital ${stamp}`
     });
     const adminToken = adminReg.token;
     console.log("-> Admin registration successful. Token obtained.");
@@ -59,7 +64,7 @@ async function runTests() {
     console.log("\n4. Attempting to register user with Gmail address via invite link...");
     try {
       await request(`/auth/join/${inviteCode}`, "POST", {
-        email: "hacker@gmail.com",
+        email: `hacker.${stamp}@gmail.com`,
         password: "member_password"
       });
       console.error("FAIL: Gmail registration should have been blocked!");
@@ -70,7 +75,7 @@ async function runTests() {
     // 5. Register with whitelisted subdomain email domain (should succeed)
     console.log("\n5. Registering member with whitelisted subdomain (research.stjude.org) email...");
     const memberReg = await request(`/auth/join/${inviteCode}`, "POST", {
-      email: "researcher@research.stjude.org",
+      email: `researcher.${stamp}@research.stjude.org`,
       password: "member_password_123"
     });
     const memberToken = memberReg.token;
@@ -126,7 +131,7 @@ async function runTests() {
     console.log("\n12. Attempting to register via revoked invite link...");
     try {
       await request(`/auth/join/${inviteCode}`, "POST", {
-        email: "another_researcher@stjude.org",
+        email: `another_researcher.${stamp}@stjude.org`,
         password: "member_password"
       });
       console.error("FAIL: Registration via revoked link should have been blocked!");

@@ -312,7 +312,7 @@ Against `arch.md`. "Partial" means implemented with a material caveat documented
 | §1 | Presigned URL, direct-to-storage upload | ⚠️ Partial | `jobs.ts:123-128`; mocked locally, no size/content conditions |
 | §1 | Isolated GPU worker containers via message queue | ⚠️ Partial | `worker.ts` consumes RabbitMQ, but simulates the model and is not containerized |
 | §1 | Real-time notification via SSE | ❌ Broken | `EventSource` cannot send Bearer; hub is per-process — §4 |
-| §1 | Configurable data retention / lifecycle rules | ❌ Missing | Nothing implements it |
+| §1 | Configurable data retention / lifecycle rules | ✅ | `src/retention.ts`, `STORAGE_RETENTION_DAYS`; bucket lifecycle equivalent documented for real S3 |
 | §2 | Organization owns shared credit pool | ✅ | `schema.ts:9-16` |
 | §2 | Roles `ORG_ADMIN` / `MEMBER` | ⚠️ Partial | Enum + `requireRole` exist; enforced only on `/api/invites` |
 | §2 | S3 paths segregated by organization UUID | ✅ | `jobs.ts:99` — `org_id=<uuid>/jobs/<uuid>/raw.png` |
@@ -324,7 +324,7 @@ Against `arch.md`. "Partial" means implemented with a material caveat documented
 | §3 | Toggleable `is_active` panic/revoke | ✅ | `invites.ts:64-97`; verified in `initial_backend` step 11-12 |
 | §4 | Credits deducted only on success | ↔️ Deliberate deviation | Reserve-at-queue + refund-on-failure. See §2 — the deviation is correct and endorsed by `architecture_specification.md` §3 |
 | §4 | Row-level locking against concurrent exhaustion | ✅ | `jobs.ts:79-81` — `SELECT … FOR UPDATE` inside a transaction |
-| §4 | Failed/timed-out job must not consume credit | ⚠️ Partial | Failure refunds (`worker.ts:129-131`); **timeout is unimplemented**, and abandoned reservations strand credits |
+| §4 | Failed/timed-out job must not consume credit | ✅ | Failure refunds via the API report path; timeout and abandoned reservations both reclaimed by `src/reaper.ts` |
 
 ---
 
@@ -340,8 +340,8 @@ Implementation defects, ordered by unblocking value. Design work is ordered sepa
 | ~~4~~ | ~~Worker reports completion to the API instead of writing the DB; one hub serves clients~~ | — | **Done.** Worker holds no DB credentials; events now reach browser clients |
 | ~~5~~ | ~~Migration adding indexes, the `credit_balance >= 0` CHECK, and working RLS (`SET LOCAL` + `FORCE`)~~ | — | **Done.** Indexes and CHECK in `0001`; RLS in `0002`. Verified by `npm run test:rls` |
 | ~~6~~ | ~~Correct amqplib types (`ChannelModel`) and null guards~~ | — | **Done.** `tsc --noEmit` is clean |
-| 7 | Reaper for abandoned `PENDING`/`PROCESSING` jobs; DLQ | Medium | Stops credit leakage and silent message loss. Report replay is now refused (409), so double-refund is closed |
-| 8 | S3 lifecycle/retention rules; real VIP consumer or remove the routing stub | Medium | Compliance gap, plus VIP jobs currently hang forever |
+| ~~7~~ | ~~Reaper for abandoned `PENDING`/`PROCESSING` jobs; DLQ~~ | — | **Done.** `src/reaper.ts`, dead-letter topology in `src/queue/index.ts`. Verified by `npm run test:lifecycle` |
+| ~~8~~ | ~~S3 lifecycle/retention rules; real VIP consumer or remove the routing stub~~ | — | **Done.** `src/retention.ts`; tier column replaces the name-substring stub, VIP is a real queue a dedicated pool consumes |
 | — | ~~`apiFetch` body serialization~~ | — | **Resolved** by the Next.js migration |
 | — | ~~Missing `Sparkles` import~~ | — | **Resolved** by the Next.js migration |
 
@@ -352,6 +352,12 @@ Implementation defects, ordered by unblocking value. Design work is ordered sepa
 ```bash
 cd backend  && npx tsc --noEmit     # 7 errors at 9b53949; 0 after fixes #1 and #6
 cd frontend && npx tsc --noEmit     # 10 errors at 9b53949; 0 after the Next.js migration
+
+# With docker compose up, the API, and the worker running:
+cd backend
+npm run test:flow        # end-to-end product flow
+npm run test:rls         # tenant isolation, with predicates deliberately omitted
+npm run test:lifecycle   # reaper, dead-lettering, tier routing
 ```
 
 ### How RLS was implemented
@@ -366,12 +372,24 @@ Enabling RLS is not additive — done partially it takes the system down, and do
 
 `npm run test:rls` (`src/test-rls.ts`) is the regression test. Every query in it deliberately omits the organization predicate, so it fails loudly if policies are dropped, if the app role regains superuser or `BYPASSRLS`, or if the context stops being applied. Observed: with 4 jobs across 5 organizations, a query with no context returns 0 rows; the same unscoped query inside tenant A's context returns only A's single job; tenant B's set is disjoint; a cross-tenant `UPDATE` matches 0 rows; and a fresh query after commit sees 0, confirming the context does not survive onto the pooled connection.
 
-**Status update.** Fixes #1 through #6 have all been applied. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+### Job lifecycle and retention (fixes #7 and #8)
+
+`src/reaper.ts` sweeps on an interval and reclaims credits from jobs that will never finish: `PENDING` past `JOB_PENDING_TIMEOUT_MINUTES` (a reservation whose client never dispatched — closing the tab after the upload was enough) and `PROCESSING` past `JOB_PROCESSING_TIMEOUT_MINUTES` measured from the new `started_at` column, so a long queue wait is not mistaken for a stalled worker. The refund is issued by `UPDATE ... WHERE status = <expected>`, so if a worker settles the job first, zero rows match and no second refund happens. The specification required that a job which "fails or times out" not consume credit; only the failure half had ever been implemented.
+
+Each tier queue now dead-letters to `jobs.dlx`. The worker retries a report in-process (transient errors only — a 409 is the API's considered answer and is not retried), and on exhaustion nacks without requeue so the message lands in `queue-standard-jobs.dlq` rather than being acked away in a `finally` block. The earlier hot-requeue loop is gone.
+
+VIP routing was a stub that shipped: it keyed off `org.name.includes("vip")`, and no consumer existed for the per-tenant queue it produced, so such a job would sit `PENDING` forever with its credit reserved. Organizations now carry an `infrastructure_tier` column, and there is one queue per tier rather than one per tenant — a dedicated pool is started with `WORKER_QUEUES=queue-vip-jobs`.
+
+`src/retention.ts` expires stored images after `STORAGE_RETENTION_DAYS`, leaving job metadata untouched because the specification keeps it indefinitely for billing and audit. On real S3 this sweeper is the wrong mechanism and the file documents the equivalent bucket lifecycle rule, which cannot be skipped by a process that failed to start.
+
+`npm run test:lifecycle` covers all of it: a fresh job is left alone, an aged `PENDING` and an aged `PROCESSING` are both expired with exactly one credit returned, a second sweep does not double-refund, an unprocessable message reaches the DLQ, and a VIP tenant's job lands on the VIP queue.
+
+**Status update.** All eight fixes have been applied. Four suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 
 Every remaining finding in this document stands as written and was verified against commit `9b53949`.
 
-One further defect, found while re-verifying: **`src/test-flow.ts` is not idempotent.** It registers hardcoded email addresses, so a second run aborts at step 1 with `409 Email is already registered` and the tables must be truncated between runs.
+One further defect, found while re-verifying: **`src/test-flow.ts` was not idempotent.** It registered hardcoded email addresses, so a second run aborted at step 1 with `409 Email is already registered`. Now resolved — identities are stamped per run, and the suite passes twice in a row against a non-empty database.
 
 Local infrastructure note: `docker-compose.override.yml` (gitignored) publishes the Postgres container on **5433**, because a locally installed PostgreSQL already occupies 5432 with different credentials. `DATABASE_URL` in `backend/.env` points there.

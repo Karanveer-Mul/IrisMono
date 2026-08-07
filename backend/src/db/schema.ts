@@ -4,6 +4,7 @@ import { relations, sql } from "drizzle-orm";
 // Custom enums
 export const userRoleEnum = pgEnum("user_role", ["ORG_ADMIN", "MEMBER"]);
 export const jobStatusEnum = pgEnum("job_status", ["PENDING", "PROCESSING", "SUCCESS", "FAILED"]);
+export const infrastructureTierEnum = pgEnum("infrastructure_tier", ["STANDARD", "VIP"]);
 
 // 1. Organizations
 export const organizations = pgTable("organizations", {
@@ -11,6 +12,8 @@ export const organizations = pgTable("organizations", {
   name: varchar("name", { length: 255 }).notNull(),
   creditBalance: integer("credit_balance").notNull().default(3),
   allowedDomains: text("allowed_domains").array().notNull().default(sql`'{}'::text[]`),
+  // Which pool of GPU workers serves this tenant.
+  infrastructureTier: infrastructureTierEnum("infrastructure_tier").notNull().default("STANDARD"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -48,6 +51,9 @@ export const jobs = pgTable("jobs", {
   maskImageS3Key: varchar("mask_image_s3_key", { length: 512 }),
   errorMessage: text("error_message"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  // Set when a worker claims the job. PROCESSING is aged from here, not from
+  // created_at, so a long queue wait is not mistaken for a stalled worker.
+  startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 });
 
