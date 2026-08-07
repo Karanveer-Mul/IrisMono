@@ -27,6 +27,7 @@ import {
 const API = "http://localhost:3000/api";
 const AMQP_URL = process.env.AMQP_URL || "amqp://guest:guest@localhost:5672";
 const WORKER_SECRET = process.env.WORKER_SECRET || "local-dev-worker-secret";
+const STORAGE_EVENT_SECRET = process.env.STORAGE_EVENT_SECRET || "local-dev-storage-secret";
 
 function assert(condition: boolean, message: string) {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -386,6 +387,90 @@ async function run() {
   console.log(`   -> same worker: ${sameWorker.status}, different worker: ${otherWorker.status}`);
   assert(sameWorker.status === 200, "a worker could not re-claim its own job after redelivery");
   assert(otherWorker.status === 409, "a second worker was allowed to take a job already in flight");
+
+  // ---------------------------------------------------------------
+  console.log("\n13. A rejected upload settles the job instead of stranding the credit");
+  await grantCredits(systemDb, org.orgId, 2, "MANUAL_ADJUSTMENT", "lifecycle test top-up");
+
+  const uploadUrlFor = async () => {
+    const r = await fetch(`${API}/jobs/request`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${org.token}` },
+    });
+    return r.json();
+  };
+
+  const notPng = await uploadUrlFor();
+  const balanceBeforeReject = await balanceOf(org.orgId);
+  const wrongFormat = await fetch(notPng.uploadUrl, {
+    method: "PUT",
+    body: Buffer.from("MZ this is not a png at all, it is an executable"),
+    headers: { "Content-Type": "image/png" },
+  });
+  // The settlement happens as the request is answered; give it a moment to land.
+  await new Promise((r) => setTimeout(r, 400));
+  const rejectedRow = await jobRow(notPng.jobId);
+  console.log(
+    `   -> HTTP ${wrongFormat.status}, job ${rejectedRow.status}, balance ${balanceBeforeReject} -> ${await balanceOf(org.orgId)}`
+  );
+  assert(wrongFormat.status === 415, "a non-PNG body was accepted as a scan");
+  assert(rejectedRow.status === "FAILED", "the rejected upload left the job PENDING");
+  assert(
+    (await balanceOf(org.orgId)) === balanceBeforeReject + 1,
+    "the credit was not returned when the upload was refused"
+  );
+
+  const oversized = await uploadUrlFor();
+  const tooBig = Buffer.alloc(26 * 1024 * 1024);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(tooBig);
+  const overLimit = await fetch(oversized.uploadUrl, {
+    method: "PUT",
+    body: tooBig,
+    headers: { "Content-Type": "image/png" },
+  }).catch(() => ({ status: 413 }) as Response);
+  await new Promise((r) => setTimeout(r, 400));
+  console.log(`   -> 26MB upload answered HTTP ${overLimit.status}, job ${(await jobRow(oversized.jobId)).status}`);
+  assert(overLimit.status === 413, "an oversized body was accepted");
+  assert((await jobRow(oversized.jobId)).status === "FAILED", "the oversized upload left the job PENDING");
+
+  // ---------------------------------------------------------------
+  console.log("\n14. A storage event queues the job, and only the right caller may send one");
+  await grantCredits(systemDb, org.orgId, 1, "MANUAL_ADJUSTMENT", "lifecycle test top-up");
+  const eventJob = await reserveJob(org.token);
+  const rawKey = `org_id=${org.orgId}/jobs/${eventJob}/raw.png`;
+
+  const unauthorizedEvent = await fetch(`${API}/jobs/storage-events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-storage-secret": "wrong" },
+    body: JSON.stringify({ key: rawKey }),
+  });
+  console.log(`   -> without the secret: ${unauthorizedEvent.status}`);
+  assert(unauthorizedEvent.status === 401, "the storage event endpoint accepted an unauthenticated caller");
+
+  const vipDepthBeforeEvent = (await ch.checkQueue(QUEUES.VIP)).messageCount;
+  const notified = await fetch(`${API}/jobs/storage-events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-storage-secret": STORAGE_EVENT_SECRET },
+    // The S3 notification envelope, as a real bucket would send it.
+    body: JSON.stringify({ Records: [{ s3: { object: { key: rawKey } } }] }),
+  });
+  const notifiedBody = await notified.json();
+  await new Promise((r) => setTimeout(r, 500));
+  const vipDepthAfterEvent = (await ch.checkQueue(QUEUES.VIP)).messageCount;
+  console.log(`   -> ${notifiedBody.results[rawKey]}, queue depth ${vipDepthBeforeEvent} -> ${vipDepthAfterEvent}`);
+  assert(notified.status === 200, "a valid storage event was refused");
+  assert(vipDepthAfterEvent === vipDepthBeforeEvent + 1, "the storage event did not queue the job");
+
+  // A mask written by a worker lands in the same bucket and must not start
+  // anything - otherwise every completed job would re-queue itself.
+  const maskEvent = await fetch(`${API}/jobs/storage-events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-storage-secret": STORAGE_EVENT_SECRET },
+    body: JSON.stringify({ key: `org_id=${org.orgId}/jobs/${eventJob}/mask.png` }),
+  });
+  const maskBody = await maskEvent.json();
+  console.log(`   -> a mask key is ${Object.values(maskBody.results)[0]}`);
+  assert(Object.values(maskBody.results)[0] === "ignored", "a mask upload started a job");
 
   // Leave the broker as we found it.
   await ch.purgeQueue(QUEUES.VIP);

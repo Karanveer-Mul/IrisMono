@@ -1,16 +1,17 @@
 import { Router, Request, Response } from "express";
 import { systemDb, withTenant } from "../db";
 import { organizations, jobs } from "../db/schema";
-import { eq, and, isNull, sql } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import {
   authenticateJWT,
+  authenticateStorageEvent,
   authenticateStreamToken,
   authenticateWorker,
   AuthenticatedRequest,
 } from "../middleware/auth";
+import { dispatchJob } from "../dispatch";
 import { sseHub } from "../sse";
 import { publishJobEvent } from "../sse/bus";
-import { publishJob, QUEUES } from "../queue";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
@@ -42,6 +43,71 @@ const s3Client = new S3Client({
   },
   forcePathStyle: true,
 });
+
+/**
+ * Ceiling on a single uploaded scan.
+ *
+ * A presigned PUT lets the client choose the body, so nothing upstream bounds
+ * it. Enforced while streaming rather than from Content-Length, because the
+ * client picks that too.
+ */
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024);
+
+/** The eight bytes every PNG starts with. */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * Recovers the job id from a raw-scan object key.
+ *
+ * Keys are `org_id=<orgId>/jobs/<jobId>/raw.png`. Only raw scans start a job;
+ * a mask written by a worker lands in the same bucket and must not.
+ */
+function jobIdFromKey(key: string): string | null {
+  const match = /\/jobs\/([0-9a-f-]{36})\/raw\.png$/i.exec(key);
+  return match ? match[1] : null;
+}
+
+/**
+ * Settles a job whose upload was refused.
+ *
+ * The upload has been answered, so nothing further is coming for this job.
+ * Leaving it PENDING would hold the customer's credit until the reaper expired
+ * it half an hour later, for a request that was rejected immediately.
+ */
+async function failRejectedUpload(jobId: string, reason: string) {
+  try {
+    await systemDb.transaction(async (tx) => {
+      const locked = await tx.execute(
+        sql`SELECT organization_id, status FROM jobs WHERE id = ${jobId} FOR UPDATE`
+      );
+      if (locked.rows.length === 0) return;
+
+      const row = locked.rows[0] as { organization_id: string; status: string };
+      if (row.status !== "PENDING") return;
+
+      await tx
+        .update(jobs)
+        .set({
+          status: "FAILED",
+          errorMessage: `Upload rejected: ${reason}`,
+          completedAt: sql`NOW()`,
+        })
+        .where(eq(jobs.id, jobId));
+
+      await refundCredit(tx, row.organization_id, jobId, `Upload rejected: ${reason}`);
+
+      await publishJobEvent(row.organization_id, "JOB_STATUS_CHANGE", {
+        jobId,
+        status: "FAILED",
+        error: `Upload rejected: ${reason}`,
+      });
+    });
+  } catch (error) {
+    // The reaper is the backstop if this fails; the credit is not lost, only
+    // returned later than it should have been.
+    console.error(`Could not settle rejected upload for job ${jobId}:`, error);
+  }
+}
 
 /** Page size for the audit log, and the ceiling a caller may ask for. */
 const DEFAULT_LOG_PAGE = 50;
@@ -113,7 +179,15 @@ async function recordQueueWait(orgId: string, createdAt: Date | null, startedAt:
  * Bearer middleware below.
  * ------------------------------------------------------------------ */
 
-// Public Mock upload endpoint (bypasses JWT to behave like S3)
+/**
+ * Mock object storage: the direct upload target.
+ * PUT /api/jobs/mock-upload/:jobId
+ *
+ * Stands in for a presigned PUT to S3, so it authenticates the way one does -
+ * by possession of a URL naming a job that is still waiting for its image,
+ * not by a session. Two things happen here that the old version did not do:
+ * the upload is validated, and completing it dispatches the job.
+ */
 router.put("/mock-upload/:jobId", async (req, res) => {
   const { jobId } = req.params;
 
@@ -125,22 +199,146 @@ router.put("/mock-upload/:jobId", async (req, res) => {
     const filePath = path.join(UPLOADS_DIR, `${jobId}-raw.png`);
     const writeStream = fs.createWriteStream(filePath);
 
-    req.pipe(writeStream);
+    let received = 0;
+    let rejection: string | null = null;
+    let signatureChecked = false;
 
-    writeStream.on("finish", () => {
-      console.log(`Mock S3 direct-upload completed locally for job ${jobId}`);
-      return res.status(200).json({ message: "Mock S3 direct-upload completed successfully" });
+    const abort = async (reason: string, statusCode: number) => {
+      if (rejection) return;
+      rejection = reason;
+
+      req.unpipe(writeStream);
+      writeStream.destroy();
+      await fs.promises.rm(filePath, { force: true }).catch(() => {});
+
+      // The reservation is settled here rather than left to the reaper. The
+      // upload was answered - nothing further is coming for this job - so
+      // holding the customer's credit for thirty minutes would be punitive.
+      await failRejectedUpload(jobId, reason);
+
+      if (!res.headersSent) {
+        res.status(statusCode).json({ error: reason });
+      }
+      req.destroy();
+    };
+
+    req.on("data", (chunk: Buffer) => {
+      if (rejection) return;
+
+      // A presigned PUT sets only ContentType: the client picks the body, so
+      // the ceiling has to be enforced where the bytes land. Checked as they
+      // stream, not from Content-Length, which the client also picks.
+      received += chunk.length;
+      if (received > MAX_UPLOAD_BYTES) {
+        void abort(`Upload exceeds the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB limit`, 413);
+        return;
+      }
+
+      // The first bytes decide the format. A GPU worker should never be the
+      // thing that discovers a scan is a zip file.
+      if (!signatureChecked && chunk.length >= PNG_SIGNATURE.length) {
+        signatureChecked = true;
+        if (!chunk.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+          void abort("Upload is not a PNG image", 415);
+        }
+      }
+    });
+
+    writeStream.on("finish", async () => {
+      if (rejection) return;
+
+      if (received === 0) {
+        return abort("Upload is empty", 400);
+      }
+
+      console.log(`Mock S3 direct-upload completed locally for job ${jobId} (${received} bytes)`);
+
+      // Upload completion *is* the trigger. On real S3 this is the bucket's
+      // event notification calling POST /api/jobs/storage-events; here the
+      // mock storage layer is in-process, so it calls dispatch directly.
+      try {
+        const result = await dispatchJob(jobId, { requestId: req.requestId });
+        return res.status(200).json({
+          message: "Upload completed successfully",
+          dispatched: result.dispatched,
+          ...(result.dispatched ? { queue: result.queue } : {}),
+        });
+      } catch (dispatchError) {
+        // The image is stored; only the queueing failed. Answering 500 lets the
+        // client retry the upload, which will dispatch it then.
+        console.error(`Upload stored but dispatch failed for job ${jobId}:`, dispatchError);
+        return res.status(500).json({ error: "Upload stored but could not be queued" });
+      }
     });
 
     writeStream.on("error", (err) => {
+      if (rejection) return;
       console.error("Mock upload write error:", err);
-      return res.status(500).json({ error: "Mock upload failed writing file" });
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Mock upload failed writing file" });
+      }
     });
+
+    req.pipe(writeStream);
 
   } catch (error) {
     console.error("Mock upload catch error:", error);
     return res.status(500).json({ error: "Mock upload handler failed" });
   }
+});
+
+/**
+ * Object storage event notification
+ * POST /api/jobs/storage-events
+ *
+ * What a real deployment wires the bucket to. S3 sends an ObjectCreated
+ * notification, and that notification is what queues the job - so the browser
+ * is never trusted to report its own upload, and an image can never sit in the
+ * bucket with nothing scheduled to process it.
+ *
+ * Authenticated by shared secret, like the worker's report: the caller is
+ * infrastructure, not a user, and it identifies the job by object key alone.
+ */
+router.post("/storage-events", authenticateStorageEvent, async (req: Request, res: Response) => {
+  // Accepts the S3 notification envelope, and a flat {key} for anything else
+  // that can be pointed at a webhook.
+  const records = Array.isArray(req.body?.Records) ? req.body.Records : null;
+  const keys: string[] = records
+    ? records
+        .map((record: any) => record?.s3?.object?.key)
+        .filter((key: unknown): key is string => typeof key === "string")
+        .map((key: string) => decodeURIComponent(key.replace(/\+/g, " ")))
+    : typeof req.body?.key === "string"
+      ? [req.body.key]
+      : [];
+
+  if (keys.length === 0) {
+    return res.status(400).json({ error: "No object key in the event" });
+  }
+
+  const results: Record<string, string> = {};
+
+  for (const key of keys) {
+    const jobId = jobIdFromKey(key);
+    if (!jobId) {
+      // Not a raw scan - a mask written by a worker, or anything else in the
+      // bucket. Acknowledged so the notification is not retried forever.
+      results[key] = "ignored";
+      continue;
+    }
+
+    try {
+      const result = await dispatchJob(jobId, { requestId: req.requestId });
+      results[key] = result.dispatched ? `queued:${result.queue}` : result.reason;
+    } catch (error) {
+      console.error(`Storage event dispatch failed for ${key}:`, error);
+      // 500 so the notification is redelivered: S3 retries, and the claim was
+      // released, so a later attempt can still queue the job.
+      return res.status(500).json({ error: "Dispatch failed", results });
+    }
+  }
+
+  return res.status(200).json({ results });
 });
 
 /**
@@ -503,89 +701,40 @@ router.get("/logs", async (req: AuthenticatedRequest, res: Response) => {
 });
 
 /**
- * 3. Trigger job execution (Notify API that S3 upload completed)
+ * 3. Dispatch fallback
  * POST /api/jobs/:jobId/trigger
+ *
+ * No longer part of the normal path: the upload dispatches the job, because the
+ * client should not be load-bearing for a state transition it does not own.
+ * This remains for the case where storage event notifications are not wired up
+ * yet, and for operators re-queueing a job by hand.
+ *
+ * It is safe to call redundantly. A job the upload already dispatched answers
+ * 400, and only one caller can ever win the claim, so calling it after an
+ * upload cannot double-queue the scan.
  */
 router.post("/:jobId/trigger", async (req: AuthenticatedRequest, res: Response) => {
   const { jobId } = req.params;
   const orgId = req.user!.organizationId;
 
   try {
-    // Claim the right to dispatch, rather than checking for it.
-    //
-    // The old shape was read, check status, publish - with nothing holding the
-    // job still in between, so two concurrent triggers both saw PENDING and
-    // both published. Only one caller can win this UPDATE, and only the winner
-    // reaches the publish below.
-    const found = await withTenant(orgId, async (tx) => {
-      const [claimed] = await tx
-        .update(jobs)
-        .set({ dispatchedAt: sql`NOW()` })
-        .where(
-          and(
-            eq(jobs.id, jobId),
-            eq(jobs.organizationId, orgId),
-            eq(jobs.status, "PENDING"),
-            isNull(jobs.dispatchedAt)
-          )
-        )
-        .returning();
+    // Scoped to the caller's organization, unlike the storage-event path: this
+    // one has a session, so it must not be able to reach another tenant's job.
+    const result = await dispatchJob(jobId, { requestId: req.requestId, organizationId: orgId });
 
-      // Only read the row back when the claim failed, to say why.
-      const existing = claimed
-        ? claimed
-        : await tx.query.jobs.findFirst({
-            where: and(eq(jobs.id, jobId), eq(jobs.organizationId, orgId)),
-          });
-
-      const org = await tx.query.organizations.findFirst({
-        where: eq(organizations.id, orgId),
-      });
-
-      return { job: claimed, existing, org };
-    });
-
-    const { job, existing, org } = found;
-
-    if (!job) {
-      if (!existing) {
+    if (!result.dispatched) {
+      if (result.reason === "not_found") {
         return res.status(404).json({ error: "Job record not found." });
       }
-      // Already dispatched, or already past PENDING. Same answer either way:
-      // this caller is not the one that gets to queue it.
       return res.status(400).json({
-        error: `Job has already been dispatched. Current status: ${existing.status}`,
+        error: `Job has already been dispatched. Current status: ${result.status}`,
       });
-    }
-
-    // Determine target queue from the organization's infrastructure tier.
-    // One queue per tier, not per tenant - see src/queue/index.ts.
-    const queueName = org?.infrastructureTier === "VIP" ? QUEUES.VIP : QUEUES.STANDARD;
-
-    // Publish task message to RabbitMQ queue. The correlation id travels with
-    // it, so the worker's log lines and its report back to the API carry the
-    // same id as the browser request that dispatched the job.
-    try {
-      await publishJob(queueName, {
-        jobId: job.id,
-        orgId: orgId,
-        s3Key: job.rawImageS3Key,
-        requestId: req.requestId,
-      });
-    } catch (publishError) {
-      // The claim is released so the caller can try again. Left set, a broker
-      // hiccup would strand the job in PENDING until the reaper expired it -
-      // trading a rare double-dispatch for a routine dropped one.
-      await withTenant(orgId, (tx) =>
-        tx.update(jobs).set({ dispatchedAt: null }).where(eq(jobs.id, job.id))
-      );
-      throw publishError;
     }
 
     return res.status(202).json({
       message: "Job successfully queued for processing",
-      jobId: job.id,
-      queue: queueName,
+      jobId,
+      queue: result.queue,
     });
 
   } catch (error) {

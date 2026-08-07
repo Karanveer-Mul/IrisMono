@@ -67,7 +67,7 @@ The frontend runs on 3001 because the API holds 3000. `/api/*` is rewritten to t
 
 ### 4. Try it
 
-Open http://localhost:3001, choose **Create Workspace**, and register. The first account creates an organization, becomes its `ORG_ADMIN`, and receives 3 trial credits. Upload any image; the simulated worker takes ~5 seconds and succeeds about 90% of the time (the failure path is deliberate — it exercises the credit refund).
+Open http://localhost:3001, choose **Create Workspace**, and register. The first account creates an organization, becomes its `ORG_ADMIN`, and receives 3 trial credits. Upload a PNG — the storage layer rejects anything else — and the upload itself queues the job. The simulated worker takes ~5 seconds and succeeds about 90% of the time (the failure path is deliberate — it exercises the credit refund).
 
 ---
 
@@ -76,12 +76,15 @@ Open http://localhost:3001, choose **Create Workspace**, and register. The first
 ```
 Browser ──1. reserve credit ──▶ API ──▶ Postgres (job + ledger entry)
         ──2. PUT image ───────▶ Object storage (mocked to ./uploads)
-        ──3. trigger ─────────▶ API ──▶ RabbitMQ ──▶ GPU worker
-                                                        │
-                                          4. report outcome (shared secret)
-                                                        ▼
-        ◀── 6. SSE ─────────── API ◀── 5. fanout ── all API instances
+                                        │
+                          3. upload completed ──▶ API ──▶ RabbitMQ ──▶ GPU worker
+                                                                          │
+                                                    4. report outcome (shared secret)
+                                                                          ▼
+        ◀── 6. SSE ────────────────────── API ◀── 5. fanout ── all API instances
 ```
+
+The browser makes two calls, not three. **Completing the upload is what queues the job** — on real S3 that is the bucket's event notification calling `POST /api/jobs/storage-events`; locally the mock storage layer is the API itself, so it dispatches directly. A closed tab can no longer strand a reserved credit, and a job can never be queued for an image that was never uploaded.
 
 A few decisions worth knowing before reading the code:
 
@@ -93,6 +96,7 @@ A few decisions worth knowing before reading the code:
 - **Liveness and readiness are different questions.** Only readiness consults Postgres and RabbitMQ — see "Operations" below.
 - **A failed job is retried before it is abandoned.** Delay queues hold it for `10s`, `60s`, then `300s`; expiry in the delay queue *is* the redelivery. Only after those does it dead-letter.
 - **Dispatch is single-shot.** `dispatched_at` is claimed by one caller, so a double-clicked trigger cannot queue the same scan twice.
+- **Uploads are validated at the storage layer.** Size ceiling enforced as bytes stream in (not from `Content-Length`, which the client picks), and the PNG signature is checked. A rejected upload fails the job and returns the credit immediately rather than waiting for the reaper.
 
 ### Database identities
 
@@ -149,6 +153,8 @@ cd frontend && npx tsc --noEmit
 | `WORKER_SECRET` | `local-dev-worker-secret` | Authenticates the worker's job reports. Change alongside `JWT_SECRET`. |
 | `MODEL_VERSION` | `irismono-seg-sim-0.1.0` | Stamped onto every completed job. In a real deployment this is the image tag or model digest, injected at deploy time. The API rejects a `SUCCESS` report without it. |
 | `WORKER_QUEUES` | `queue-standard-jobs` | Start a second worker with `queue-vip-jobs` to give enterprise tenants dedicated capacity. |
+| `STORAGE_EVENT_SECRET` | `local-dev-storage-secret` | Authenticates `POST /api/jobs/storage-events`. Separate from `WORKER_SECRET` on purpose — the notifier can start work, the worker can settle it. |
+| `MAX_UPLOAD_BYTES` | `26214400` | Ceiling on a single scan, enforced while streaming. |
 | `JOB_RETRY_DELAYS_MS` | `10000,60000,300000` | Redelivery schedule for a job whose outcome could not be established. One holding queue is declared per entry, so changing this adds or removes queues rather than altering existing ones. Exhausting the list dead-letters the message. |
 | `JOB_PENDING_TIMEOUT_MINUTES` | `30` | After this, an undispatched reservation is expired and its credit returned. |
 | `METRICS_TOKEN` | empty | Bearer token for `/metrics` and `/health/workers`. Unset leaves them open; see Operations. |
@@ -156,6 +162,22 @@ cd frontend && npx tsc --noEmit
 | `WORKER_STALE_AFTER_SECONDS` | `45` | When the API stops counting a worker as online. Set independently of the worker's own heartbeat interval, because the API cannot know how a given worker was configured. |
 | `SHUTDOWN_DRAIN_MS` | `0` | How long to keep serving after SIGTERM. Zero suits local development; see Operations for what a deployment needs. |
 | `STORAGE_RETENTION_DAYS` | `30` | Deletes stored images. Job metadata is kept indefinitely for billing and audit. On real S3, use a bucket lifecycle rule instead — see `src/retention.ts`. |
+
+**Wiring a real bucket.** Point `AWS_S3_ENDPOINT` at S3, MinIO, or LocalStack, then configure the bucket to notify the API on upload — that notification is what queues the job:
+
+```bash
+aws s3api put-bucket-notification-configuration \
+  --bucket <bucket> \
+  --notification-configuration '{
+    "TopicConfigurations": [{
+      "TopicArn": "<sns-topic-that-posts-to-/api/jobs/storage-events>",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": "raw.png"}]}}
+    }]
+  }'
+```
+
+The endpoint requires `STORAGE_EVENT_SECRET` in an `x-storage-secret` header. Note that the size ceiling cannot be enforced on a presigned PUT — a presigned POST policy with `content-length-range` is what a production deployment needs there.
 
 Storage and the ML model are both mocked for local development. Images go to `./uploads`, and the worker sleeps instead of running a model. Point `AWS_S3_ENDPOINT` at MinIO or LocalStack for real presigned uploads.
 

@@ -86,10 +86,13 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
         method: "POST",
       });
 
-      const { jobId, uploadUrl } = requestRes;
+      const { uploadUrl } = requestRes;
       setUploadProgress("Uploading raw image directly to storage...");
 
-      // 2. Upload file directly to S3/Mock storage
+      // 2. Upload file directly to storage. That is the last step: completing
+      // the upload is what queues the job, so there is no third call and no
+      // window in which a stored image has nothing scheduled to process it.
+      // Closing the tab here can no longer strand the reserved credit.
       const uploadRes = await fetch(uploadUrl, {
         method: "PUT",
         body: file,
@@ -99,15 +102,11 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
       });
 
       if (!uploadRes.ok) {
-        throw new Error(`Storage upload failed with code ${uploadRes.status}`);
+        // The storage layer rejects an oversized or non-PNG body and settles
+        // the job itself, so the credit is already back.
+        const detail = await uploadRes.json().catch(() => null);
+        throw new Error(detail?.error || `Storage upload failed with code ${uploadRes.status}`);
       }
-
-      setUploadProgress("Queuing job in message broker...");
-
-      // 3. Trigger queue execution
-      await apiFetch(`/api/jobs/${jobId}/trigger`, {
-        method: "POST",
-      });
 
       setUploadProgress(null);
       onJobCreated();

@@ -71,7 +71,7 @@ The design's own block diagram gets this right — step 6 shows the worker repor
 
 Because the missing replay forces a polling fallback regardless, and the product processes one image at a time per user, SSE is currently buying less than it costs. Either commit properly — Redis pub/sub, a persisted event log, `Last-Event-ID` resume — or drop to status polling with backoff and delete the complexity.
 
-### 2.4 The three-step upload handshake is client-driven and fragile
+### 2.4 The three-step upload handshake is client-driven and fragile *(resolved — see §7)*
 
 `POST /request` → `PUT` to storage → `POST /:jobId/trigger`. The browser is load-bearing for server state transitions:
 
@@ -494,7 +494,30 @@ This is distinct from the worker's in-process report retries, which cover a few 
 
 `test:lifecycle` now covers all of it end to end: an unprocessable message is parked in tier one rather than dead-lettered, the same message arriving with its tiers spent *is* dead-lettered, a message left in a delay queue reappears on its work queue once the TTL elapses, `scheduleRetry` refuses to schedule past the last tier, two concurrent triggers yield exactly one 202 and one queued message, a worker re-claims its own job but a second worker is refused, and two pages of the audit log share no rows while a malformed cursor is rejected.
 
-**Status update.** All eight defect fixes have been applied, plus six items from the design critique — the credit ledger, job provenance, the SSE bus, the identity model, the operational surface, and the queue topology's retry policy and idempotency. Eight suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, `test:sse`, `test:identity`, `test:observability`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+### Storage-driven dispatch (design item §2.4)
+
+Dispatch was a step the browser performed: `request` → `PUT` → `trigger`. That made the client load-bearing for a state transition it has no business owning, and the two failure modes were real. Closing the tab between the upload and the trigger stranded a reserved credit — the reaper reclaims it now, but half an hour later, which is a patch and not a fix. Calling the trigger without uploading spent GPU scheduling on an image that did not exist.
+
+**Completing the upload is now what queues the job.** There is no third call. The two states cannot diverge: no window in which an image exists with nothing scheduled to process it, and none in which a job is queued with no image to process.
+
+This did **not** require replacing the local mock. The relevant property of an S3 event notification is that the *storage layer* reports completion, not the client — and the mock storage layer is the API itself, so it can say so directly. Both paths funnel into one `dispatchJob()`:
+
+- **Real S3** posts its `ObjectCreated` notification to `POST /api/jobs/storage-events`, authenticated by `STORAGE_EVENT_SECRET`. It accepts the S3 `Records` envelope and a flat `{key}` for anything else pointed at a webhook. A 500 is returned on dispatch failure so S3 redelivers — the claim is released, so a later attempt still queues the job.
+- **The mock** calls `dispatchJob()` from the upload handler's `finish` event.
+
+A separate secret from the worker's, because they are different trust domains with different blast radii: the notifier can start work, the worker can settle it. Rotating one should not require rotating the other. Only raw-scan keys start a job — a mask written by a worker lands in the same bucket, and treating it as a trigger would make every completed job re-queue itself.
+
+**Uploads are validated now.** §2.4 noted that a presigned PUT sets only `ContentType`, so the client picks both the body and the declared type. The size ceiling (`MAX_UPLOAD_BYTES`, 25 MB) is enforced as the bytes stream in rather than from `Content-Length`, which the client also chooses, and the first eight bytes must be the PNG signature — a GPU worker should never be the thing that discovers a scan is a zip file.
+
+A rejected upload **settles the job rather than leaving it to the reaper**. The request has been answered, so nothing further is coming; holding the customer's credit for thirty minutes after an immediate rejection would be punitive. The job goes `FAILED` with the reason, the credit returns through the ledger, and an SSE event fires.
+
+`POST /jobs/:id/trigger` remains as a fallback — for deployments that have not wired notifications yet, and for an operator re-queueing by hand. It is safe to call redundantly: `dispatched_at` means only one caller can ever win, so it now answers 400 for a job the upload already queued.
+
+**Not addressed here:** per-tenant upload policies, and enforcing the ceiling on the real-S3 path. A presigned PUT cannot carry a size limit; a presigned POST policy with `content-length-range` can, which is the change a production deployment needs.
+
+`test:flow` now asserts that the upload queues the job and that the old third call is refused; `test:lifecycle` covers a non-PNG body (415), a 26 MB body (413), both settling the job and returning the credit, an unauthenticated storage event (401), a valid S3-envelope event queueing to the right tier, and a mask key being ignored.
+
+**Status update.** All eight defect fixes have been applied, plus seven items from the design critique — the credit ledger, job provenance, the SSE bus, the identity model, the operational surface, the queue topology's retry policy and idempotency, and storage-driven dispatch. Eight suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, `test:sse`, `test:identity`, `test:observability`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 

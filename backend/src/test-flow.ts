@@ -90,7 +90,12 @@ async function runTests() {
 
     // 7. Perform direct mock file upload to the presigned upload URL
     console.log("\n7. Uploading raw image file direct to mock storage path...");
-    const dummyImageBuffer = Buffer.from("dummy-image-binary-data");
+    // Must start with the PNG signature: the storage layer validates the first
+    // bytes rather than trusting the Content-Type the client sent.
+    const dummyImageBuffer = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("dummy-image-binary-data"),
+    ]);
     const uploadRes = await fetch(jobRequest.uploadUrl, {
       method: "PUT",
       body: dummyImageBuffer,
@@ -101,12 +106,23 @@ async function runTests() {
     if (!uploadRes.ok) {
       throw new Error(`Direct upload failed: ${uploadRes.status}`);
     }
-    console.log("-> File upload completed.");
+    const uploadBody = await uploadRes.json();
+    console.log(`-> File upload completed, and it queued the job: ${uploadBody.queue}`);
+    if (!uploadBody.dispatched) {
+      throw new Error("Completing the upload did not dispatch the job");
+    }
 
-    // 8. Trigger job execution via queue
-    console.log("\n8. Triggering GPU worker queue execution...");
-    const triggerRes = await request(`/jobs/${jobId}/trigger`, "POST", {}, memberToken);
-    console.log(`-> Dispatched status: ${triggerRes.message} (Queue: ${triggerRes.queue})`);
+    // 8. The old third step is now redundant, and must be refused rather than
+    // queueing the same scan a second time.
+    console.log("\n8. The client's separate trigger call is no longer needed...");
+    const redundant = await fetch(`${BASE_URL}/jobs/${jobId}/trigger`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${memberToken}` },
+    });
+    console.log(`-> Redundant trigger answered HTTP ${redundant.status} (already dispatched)`);
+    if (redundant.status !== 400) {
+      throw new Error(`Expected the redundant trigger to be refused, got ${redundant.status}`);
+    }
 
     // 9. Wait for worker simulation
     console.log("\n9. Waiting 6 seconds for GPU simulation worker to complete the job...");

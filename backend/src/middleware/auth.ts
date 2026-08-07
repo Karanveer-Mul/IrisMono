@@ -6,6 +6,9 @@ const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-chan
 /** Shared secret the GPU worker presents when reporting job outcomes. */
 const WORKER_SECRET = process.env.WORKER_SECRET || "local-dev-worker-secret";
 
+/** Shared secret the object store presents when notifying an upload. */
+const STORAGE_EVENT_SECRET = process.env.STORAGE_EVENT_SECRET || "local-dev-storage-secret";
+
 /** Lifetime of a stream token. Short, because it travels in a URL. */
 const STREAM_TOKEN_TTL_SECONDS = 60;
 
@@ -112,6 +115,27 @@ export function authenticateWorker(req: Request, res: Response, next: NextFuncti
 
   if (typeof presented !== "string" || presented !== WORKER_SECRET) {
     return res.status(401).json({ error: "Invalid worker credentials" });
+  }
+
+  next();
+}
+
+/**
+ * Authenticates an object-storage event notification.
+ *
+ * The bucket is infrastructure, not a user: it proves it is the configured
+ * notification source and the API decides what that permits, which is to say
+ * "queue the job named by this key, if it is still waiting for its image".
+ *
+ * A separate secret from the worker's, because the two are different trust
+ * domains with different blast radii - the storage notifier can start work, the
+ * worker can settle it - and rotating one should not require rotating the other.
+ */
+export function authenticateStorageEvent(req: Request, res: Response, next: NextFunction) {
+  const presented = req.headers["x-storage-secret"];
+
+  if (typeof presented !== "string" || presented !== STORAGE_EVENT_SECRET) {
+    return res.status(401).json({ error: "Invalid storage event credentials" });
   }
 
   next();
