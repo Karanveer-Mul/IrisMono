@@ -61,7 +61,7 @@ These are problems with the *design*, not the code. They would survive fixing ev
 
 The design's own block diagram gets this right — step 6 shows the worker reporting completion to the Backend API, which owns finalization and notification. **The implementation diverged from its own blueprint.** The worker should hold queue credentials plus scoped object-storage access, and nothing else.
 
-### 2.3 The in-process SSE hub defeats the architecture it serves
+### 2.3 The in-process SSE hub defeats the architecture it serves *(resolved — see §7)*
 
 `src/sse/index.ts` is a `Map` in Node process memory. Consequences:
 
@@ -313,7 +313,7 @@ Against `arch.md`. "Partial" means implemented with a material caveat documented
 | §1 | Exactly 1 image at a time, config-driven | ⚠️ Partial | Client-only check, `MaskUploader.tsx:64`; no server limit, not configurable |
 | §1 | Presigned URL, direct-to-storage upload | ⚠️ Partial | `jobs.ts:123-128`; mocked locally, no size/content conditions |
 | §1 | Isolated GPU worker containers via message queue | ⚠️ Partial | `worker.ts` consumes RabbitMQ, but simulates the model and is not containerized |
-| §1 | Real-time notification via SSE | ❌ Broken | `EventSource` cannot send Bearer; hub is per-process — §4 |
+| §1 | Real-time notification via SSE | ✅ | Stream-token auth, fanout across instances, `Last-Event-ID` replay — verified by `npm run test:sse` |
 | §1 | Configurable data retention / lifecycle rules | ✅ | `src/retention.ts`, `STORAGE_RETENTION_DAYS`; bucket lifecycle equivalent documented for real S3 |
 | §2 | Organization owns shared credit pool | ✅ | `schema.ts:9-16` |
 | §2 | Roles `ORG_ADMIN` / `MEMBER` | ⚠️ Partial | Enum + `requireRole` exist; enforced only on `/api/invites` |
@@ -361,6 +361,8 @@ npm run test:flow        # end-to-end product flow
 npm run test:rls         # tenant isolation, with predicates deliberately omitted
 npm run test:lifecycle   # reaper, dead-lettering, tier routing
 npm run test:credits     # ledger integrity, refund idempotency, reconciliation
+# test:sse needs a second instance: PORT=3002 npx tsx src/index.ts
+npm run test:sse         # cross-instance delivery and Last-Event-ID replay
 ```
 
 ### How RLS was implemented
@@ -411,7 +413,23 @@ The recall path is `GET /api/jobs/logs?modelVersion=<version>`, backed by `idx_j
 
 Covered by `npm run test:lifecycle`: a `SUCCESS` with no model version is refused, provenance round-trips into the database, and the recall query isolates exactly the affected job. Confirmed end to end against the live worker, which stamps `irismono-seg-sim-0.1.0` and its host:pid.
 
-**Status update.** All eight defect fixes have been applied, plus the credit ledger and job provenance from the design critique. Five suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+### SSE bus and replay (design item §2.3)
+
+Two separate defects lived in that one `Map`. Neither is fixed by the other.
+
+**Cross-instance delivery.** Events are now published to a RabbitMQ fanout exchange (`sse.fanout`), and every API instance binds an exclusive, auto-deleted queue to it. An event published on any instance reaches the clients connected to all of them, so the notification layer can finally participate in the horizontal scaling that justifies the asynchronous design. A fanout exchange rather than Redis pub/sub: the stack already runs a broker, and adding a second piece of infrastructure to move a few hundred bytes per job is hard to justify.
+
+**Replay.** Migration `0006` adds `job_events`, an append-only log with a monotonic id, written *before* the fan-out. The stream emits `id:` on every event and honours `Last-Event-ID` on connect, replaying anything the client missed. A client that dropped during a two-minute job now learns the outcome on reconnect instead of waiting for a poll. The connection is registered before the replay query runs and buffers live events until the replay finishes, so an event arriving mid-replay cannot fall through the gap; the client's `deliveredThrough` watermark suppresses duplicates.
+
+The browser reconnects by hand rather than letting `EventSource` do it, because each attempt needs a fresh stream token — so it passes `lastEventId` itself, with capped exponential backoff.
+
+The event log is pruned after `EVENT_LOG_RETENTION_DAYS` (default 7). It only has to outlive a disconnected client; `jobs` and `credit_transactions` remain the durable record.
+
+Recording the event and pushing it are deliberately not atomic. The append is what makes an event real: if the broker is down, live clients miss the push, but a reconnecting client still replays it and polling callers still see the job state. Losing the push is degraded service, not lost data.
+
+`npm run test:sse` is the proof, and it needs two API instances (`PORT=3002 npx tsx src/index.ts`) — a single-process test could not distinguish this from the old hub. It asserts that an event published on instance B reaches a client connected to instance A, that a job completed while the client was disconnected is replayed on reconnect, that already-seen events are not resent, and that live delivery resumes afterwards.
+
+**Status update.** All eight defect fixes have been applied, plus the credit ledger, job provenance, and SSE bus from the design critique. Six suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, `test:sse`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 

@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, integer, text, boolean, timestamp, pgEnum, doublePrecision } from "drizzle-orm/pg-core";
+import { pgTable, uuid, varchar, integer, text, boolean, timestamp, pgEnum, doublePrecision, bigserial, jsonb } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 
 // Custom enums
@@ -85,6 +85,19 @@ export const creditTransactions = pgTable("credit_transactions", {
   delta: integer("delta").notNull(),
   reason: creditReasonEnum("reason").notNull(),
   note: text("note"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// 6. Job event log
+//
+// Written before an event is fanned out to the API instances. The monotonic id
+// is what a reconnecting client resumes from via Last-Event-ID.
+export const jobEvents = pgTable("job_events", {
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+  jobId: uuid("job_id"),
+  eventType: varchar("event_type", { length: 64 }).notNull(),
+  payload: jsonb("payload").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

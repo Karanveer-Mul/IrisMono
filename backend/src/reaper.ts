@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import { systemDb } from "./db";
-import { sseHub } from "./sse";
+import { publishJobEvent } from "./sse/bus";
 import { refundCredit } from "./credits";
 
 /**
@@ -87,7 +87,7 @@ export async function reapStaleJobs(): Promise<number> {
   ];
 
   for (const row of reaped) {
-    sseHub.broadcastToOrg(row.organization_id, "JOB_STATUS_CHANGE", {
+    await publishJobEvent(row.organization_id, "JOB_STATUS_CHANGE", {
       jobId: row.id,
       status: "FAILED",
       error: "Job expired. The reserved credit has been returned.",

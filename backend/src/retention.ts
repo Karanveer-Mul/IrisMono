@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { pruneJobEvents } from "./sse/bus";
 
 /**
  * Storage retention.
@@ -34,6 +35,12 @@ import * as path from "path";
 
 const RETENTION_DAYS = Number(process.env.STORAGE_RETENTION_DAYS || 30);
 const SWEEP_INTERVAL_HOURS = Number(process.env.RETENTION_SWEEP_INTERVAL_HOURS || 6);
+
+/**
+ * The SSE event log only has to outlive a disconnected client, not serve as an
+ * audit record - jobs and credit_transactions already do that indefinitely.
+ */
+const EVENT_LOG_RETENTION_DAYS = Number(process.env.EVENT_LOG_RETENTION_DAYS || 7);
 
 const UPLOADS_DIR = path.join(__dirname, "../../uploads");
 
@@ -70,6 +77,18 @@ export async function sweepExpiredArtifacts(): Promise<number> {
   return removed;
 }
 
+/** Artifacts plus the SSE event log. */
+async function sweep() {
+  await sweepExpiredArtifacts();
+
+  if (EVENT_LOG_RETENTION_DAYS > 0) {
+    const pruned = await pruneJobEvents(EVENT_LOG_RETENTION_DAYS);
+    if (pruned > 0) {
+      console.log(`[Retention] Pruned ${pruned} job event(s) older than ${EVENT_LOG_RETENTION_DAYS} days.`);
+    }
+  }
+}
+
 export function startRetentionSweeper() {
   if (RETENTION_DAYS <= 0) {
     console.log("Retention sweeper disabled (STORAGE_RETENTION_DAYS <= 0).");
@@ -78,13 +97,13 @@ export function startRetentionSweeper() {
 
   console.log(
     `Retention sweeper started: delete stored images after ${RETENTION_DAYS} days, ` +
-    `sweeping every ${SWEEP_INTERVAL_HOURS}h`
+    `prune events after ${EVENT_LOG_RETENTION_DAYS} days, sweeping every ${SWEEP_INTERVAL_HOURS}h`
   );
 
-  sweepExpiredArtifacts().catch((err) => console.error("[Retention] Sweep failed:", err));
+  sweep().catch((err) => console.error("[Retention] Sweep failed:", err));
 
   const timer = setInterval(() => {
-    sweepExpiredArtifacts().catch((err) => console.error("[Retention] Sweep failed:", err));
+    sweep().catch((err) => console.error("[Retention] Sweep failed:", err));
   }, SWEEP_INTERVAL_HOURS * 60 * 60 * 1000);
 
   timer.unref();

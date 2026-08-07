@@ -41,6 +41,10 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
   // where the state value itself would be captured stale.
   const activeJobIdRef = useRef<string | null>(null);
 
+  // Highest SSE event id seen. Sent on reconnect so the server replays anything
+  // that happened while the stream was down.
+  const lastEventIdRef = useRef<string | null>(null);
+
   const loadProfileAndLogs = useCallback(async () => {
     try {
       // 1. Fetch user org profile details
@@ -77,24 +81,45 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     loadProfileAndLogs();
 
     let eventSource: EventSource | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
+    let attempt = 0;
 
     /**
      * SSE connection. Receives real-time job status events from the backend.
      *
+     * Two wrinkles worth knowing:
+     *
      * EventSource cannot set an Authorization header, so the stream is
-     * authenticated with a short-lived token minted for this purpose and passed
-     * in the query string. The token expires in 60s, which only has to outlast
-     * the handshake - the connection itself stays open afterwards.
+     * authenticated with a short-lived token minted for the purpose and passed
+     * in the query string. The token only has to outlast the handshake.
+     *
+     * Because each reconnect needs a fresh token, we reconnect by hand rather
+     * than letting EventSource do it, which means also passing lastEventId
+     * ourselves - the server replays everything after it, so a job that
+     * finished while the connection was down is not missed.
      */
     const connect = async () => {
       try {
         const { token } = await apiFetch("/api/auth/stream-token", { method: "POST" });
         if (cancelled) return;
 
-        eventSource = new EventSource(`/api/jobs/events?token=${encodeURIComponent(token)}`);
+        const params = new URLSearchParams({ token });
+        if (lastEventIdRef.current) {
+          params.set("lastEventId", lastEventIdRef.current);
+        }
 
-        eventSource.addEventListener("JOB_STATUS_CHANGE", (e: MessageEvent) => {
+        const source = new EventSource(`/api/jobs/events?${params.toString()}`);
+        eventSource = source;
+
+        source.onopen = () => {
+          attempt = 0;
+        };
+
+        source.addEventListener("JOB_STATUS_CHANGE", (e: MessageEvent) => {
+          if (e.lastEventId) {
+            lastEventIdRef.current = e.lastEventId;
+          }
           try {
             const data = JSON.parse(e.data);
             console.log("[SSE Event] Job status change received:", data);
@@ -104,12 +129,22 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
           }
         });
 
-        eventSource.onerror = (err) => {
-          console.error("SSE stream connection error. Closing stream.", err);
-          eventSource?.close();
+        source.onerror = () => {
+          source.close();
+          if (cancelled) return;
+
+          // Backoff, capped. Resumes from lastEventId on the next attempt.
+          const delay = Math.min(1000 * 2 ** attempt, 30000);
+          attempt++;
+          console.warn(`SSE stream dropped; reconnecting in ${delay}ms.`);
+          retryTimer = setTimeout(connect, delay);
         };
       } catch (err) {
         console.error("Could not open the live job event stream:", err);
+        if (cancelled) return;
+        const delay = Math.min(1000 * 2 ** attempt, 30000);
+        attempt++;
+        retryTimer = setTimeout(connect, delay);
       }
     };
 
@@ -117,6 +152,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       eventSource?.close();
     };
   }, [user.id, loadProfileAndLogs]);

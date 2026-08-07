@@ -9,6 +9,7 @@ import {
   AuthenticatedRequest,
 } from "../middleware/auth";
 import { sseHub } from "../sse";
+import { publishJobEvent } from "../sse/bus";
 import { publishJob, QUEUES } from "../queue";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -81,7 +82,13 @@ router.get("/events", authenticateStreamToken, (req: AuthenticatedRequest, res: 
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
 
-  sseHub.addConnection(orgId, userId, res);
+  // EventSource resends Last-Event-ID automatically after a dropped connection;
+  // the query parameter is the manual equivalent for other clients.
+  const rawLastId = req.headers["last-event-id"] ?? req.query.lastEventId;
+  const parsed = typeof rawLastId === "string" ? Number(rawLastId) : NaN;
+  const lastEventId = Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+
+  sseHub.addConnection(orgId, userId, res, lastEventId);
 });
 
 /**
@@ -130,7 +137,7 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
         return res.status(409).json({ error: "Job is not PENDING" });
       }
 
-      sseHub.broadcastToOrg(updated.organizationId, "JOB_STATUS_CHANGE", {
+      await publishJobEvent(updated.organizationId, "JOB_STATUS_CHANGE", {
         jobId,
         status: "PROCESSING",
       });
@@ -199,7 +206,7 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
       return res.status(409).json({ error: `Job already finalized as ${outcome.status}` });
     }
 
-    sseHub.broadcastToOrg(outcome.orgId, "JOB_STATUS_CHANGE", {
+    await publishJobEvent(outcome.orgId, "JOB_STATUS_CHANGE", {
       jobId,
       status,
       maskImageS3Key: status === "SUCCESS" ? maskImageS3Key ?? null : undefined,

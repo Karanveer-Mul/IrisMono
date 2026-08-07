@@ -43,6 +43,13 @@
       "when": 1786000400000,
       "tag": "0005_job_provenance",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786000500000,
+      "tag": "0006_job_events",
+      "breakpoints": true
     }
   ]
 }

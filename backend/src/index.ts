@@ -5,6 +5,7 @@ import jobsRouter from "./routes/jobs";
 import invitesRouter from "./routes/invites";
 import creditsRouter from "./routes/credits";
 import { initQueue } from "./queue";
+import { initSseBus } from "./sse/bus";
 import { startReaper } from "./reaper";
 import { startRetentionSweeper } from "./retention";
 
@@ -33,6 +34,10 @@ async function startServer() {
   
   // Initialize RabbitMQ connection
   await initQueue();
+
+  // Subscribe to the cross-instance SSE fan-out, so events published by any
+  // API instance reach the clients connected to this one.
+  await initSseBus();
 
   // Background maintenance: reclaim credits from jobs that will never finish,
   // and expire stored images past the retention window.
