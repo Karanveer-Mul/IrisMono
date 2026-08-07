@@ -91,6 +91,8 @@ A few decisions worth knowing before reading the code:
 - **A session is scoped to one organization.** The JWT carries a single active `organizationId`; switching calls `POST /api/auth/switch-organization`, which re-checks the membership.
 - **SSE survives multiple API instances.** Events append to `job_events`, then fan out over a RabbitMQ exchange. Clients resume with `Last-Event-ID`.
 - **Liveness and readiness are different questions.** Only readiness consults Postgres and RabbitMQ — see "Operations" below.
+- **A failed job is retried before it is abandoned.** Delay queues hold it for `10s`, `60s`, then `300s`; expiry in the delay queue *is* the redelivery. Only after those does it dead-letter.
+- **Dispatch is single-shot.** `dispatched_at` is claimed by one caller, so a double-clicked trigger cannot queue the same scan twice.
 
 ### Database identities
 
@@ -147,6 +149,7 @@ cd frontend && npx tsc --noEmit
 | `WORKER_SECRET` | `local-dev-worker-secret` | Authenticates the worker's job reports. Change alongside `JWT_SECRET`. |
 | `MODEL_VERSION` | `irismono-seg-sim-0.1.0` | Stamped onto every completed job. In a real deployment this is the image tag or model digest, injected at deploy time. The API rejects a `SUCCESS` report without it. |
 | `WORKER_QUEUES` | `queue-standard-jobs` | Start a second worker with `queue-vip-jobs` to give enterprise tenants dedicated capacity. |
+| `JOB_RETRY_DELAYS_MS` | `10000,60000,300000` | Redelivery schedule for a job whose outcome could not be established. One holding queue is declared per entry, so changing this adds or removes queues rather than altering existing ones. Exhausting the list dead-letters the message. |
 | `JOB_PENDING_TIMEOUT_MINUTES` | `30` | After this, an undispatched reservation is expired and its credit returned. |
 | `METRICS_TOKEN` | empty | Bearer token for `/metrics` and `/health/workers`. Unset leaves them open; see Operations. |
 | `WORKER_HEALTH_PORT` | `9101` | Where a worker answers probes and scrapes. Give each worker on a shared host its own port; `0` disables the listener. |
@@ -173,6 +176,12 @@ curl -s localhost:3000/health/ready | jq
 curl -s localhost:3000/health/workers | jq
 curl -s localhost:3000/metrics | grep '^job_'
 curl -s localhost:9101/health/ready | jq          # with the worker running
+```
+
+**Retries and dead letters.** A job whose outcome could not be established is parked in `<queue>.retry.<n>`, whose TTL returns it to the work queue. Watch the tiers and the dead-letter queue together — depth in tier three means a dependency has been down for minutes, and anything in `.dlq` is a job that gave up:
+
+```bash
+docker exec irismono-rabbitmq rabbitmqctl list_queues name messages | grep -E 'retry|dlq'
 ```
 
 **What to alert on.** `queue_messages_ready` with `queue_consumers` at zero is a stopped fleet; the same depth with healthy consumers is real demand, and the two want opposite responses. `job_queue_wait_seconds` is the better autoscaling signal of the two because it is denominated in what the customer waits for. Any non-zero depth on a `.dlq` queue is work that was accepted, charged for, and abandoned. `db_pool_connections{state="waiting"}` above zero means the pool is the bottleneck, which presents as uniform latency across unrelated endpoints.

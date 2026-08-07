@@ -45,6 +45,14 @@ export const deadLettered = workerRegistry.register(
   )
 );
 
+export const retriesScheduled = workerRegistry.register(
+  new Counter(
+    "worker_retries_scheduled_total",
+    "Messages parked in a delay queue for redelivery, by attempt number. A rising tail means a dependency is down long enough to matter.",
+    ["attempt"]
+  )
+);
+
 export const busy = workerRegistry.register(
   new Gauge("worker_busy", "1 while a job is being processed, 0 while idle.", [])
 );

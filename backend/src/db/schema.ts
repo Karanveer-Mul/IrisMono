@@ -83,6 +83,9 @@ export const jobs = pgTable("jobs", {
   // created_at, so a long queue wait is not mistaken for a stalled worker.
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
+  // Set by the one caller whose trigger won. Makes dispatch single-shot: two
+  // concurrent triggers cannot both publish the job. See migration 0009.
+  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
 });
 
 // 5. Credit ledger

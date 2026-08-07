@@ -40,6 +40,10 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
   const [activeJob, setActiveJob] = useState<AuditLog | null>(null);
   const [glowCredits, setGlowCredits] = useState(false);
 
+  // Opaque cursor for the next page of the audit log; null when at the end.
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
   // Read inside callbacks that outlive a single render (SSE handler, timers),
   // where the state value itself would be captured stale.
   const activeJobIdRef = useRef<string | null>(null);
@@ -64,10 +68,13 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
         return profile.organization;
       });
 
-      // 2. Fetch jobs audit logs list
+      // 2. Fetch the first page of the audit log. Refreshing always returns to
+      // page one - anything already loaded below it is replaced, so a job that
+      // changed state cannot appear twice.
       const logsRes = await apiFetch("/api/jobs/logs");
       const list: AuditLog[] = logsRes.logs || [];
       setLogs(list);
+      setNextCursor(logsRes.nextCursor ?? null);
 
       // If tracking an active job, sync it
       const trackedId = activeJobIdRef.current;
@@ -171,6 +178,23 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
     if (list.length > 0) {
       activeJobIdRef.current = list[0].id;
       setActiveJob(list[0]);
+    }
+  };
+
+  const loadMoreLogs = async () => {
+    if (!nextCursor || loadingMore) return;
+
+    setLoadingMore(true);
+    try {
+      const res = await apiFetch(`/api/jobs/logs?cursor=${encodeURIComponent(nextCursor)}`);
+      // Appended rather than merged: the cursor guarantees the next page starts
+      // strictly after the last row already held, so there is nothing to dedupe.
+      setLogs((prev) => [...prev, ...((res.logs || []) as AuditLog[])]);
+      setNextCursor(res.nextCursor ?? null);
+    } catch (err) {
+      console.error("Failed to load more logs:", err);
+    } finally {
+      setLoadingMore(false);
     }
   };
 
@@ -357,6 +381,19 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
                     ))}
                   </tbody>
                 </table>
+
+                {nextCursor && (
+                  <div style={{ textAlign: "center", padding: "1rem 0 0.25rem" }}>
+                    <button
+                      onClick={loadMoreLogs}
+                      disabled={loadingMore}
+                      className="btn-secondary"
+                      style={{ fontSize: "0.8rem", padding: "0.45rem 1.1rem" }}
+                    >
+                      {loadingMore ? "Loading..." : "Load older jobs"}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

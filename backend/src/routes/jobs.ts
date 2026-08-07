@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { systemDb, withTenant } from "../db";
 import { organizations, jobs } from "../db/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, isNull, sql } from "drizzle-orm";
 import {
   authenticateJWT,
   authenticateStreamToken,
@@ -42,6 +42,33 @@ const s3Client = new S3Client({
   },
   forcePathStyle: true,
 });
+
+/** Page size for the audit log, and the ceiling a caller may ask for. */
+const DEFAULT_LOG_PAGE = 50;
+const MAX_LOG_PAGE = 200;
+
+/**
+ * Cursors are opaque on purpose.
+ *
+ * Base64 rather than exposing the timestamp and id, so the pagination key stays
+ * an implementation detail: changing the sort later must not break clients that
+ * stored a cursor, and a client that tries to construct one by hand is a client
+ * that will break.
+ */
+function encodeCursor(createdAt: Date, id: string): string {
+  return Buffer.from(`${createdAt.toISOString()}|${id}`).toString("base64url");
+}
+
+function decodeCursor(cursor: string): { createdAt: Date; id: string } | null {
+  try {
+    const [timestamp, id] = Buffer.from(cursor, "base64url").toString().split("|");
+    const createdAt = new Date(timestamp);
+    if (!id || Number.isNaN(createdAt.getTime())) return null;
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Records how long a job waited between reservation and being claimed.
@@ -167,7 +194,7 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
   try {
     // Interim progress: no credit implications, no transaction needed.
     if (status === "PROCESSING") {
-      const [updated] = await systemDb
+      const [claimed] = await systemDb
         .update(jobs)
         // startedAt gives the reaper a clock for execution time, separate from
         // how long the reservation has existed. workerId is recorded at claim
@@ -188,6 +215,26 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
         .where(and(eq(jobs.id, jobId), eq(jobs.status, "PENDING")))
         .returning();
 
+      // A worker re-claiming a job it already owns is a retry, not a race.
+      //
+      // Without this, backoff redelivery would be pointless: the first attempt
+      // leaves the job PROCESSING, so the redelivered copy would be refused and
+      // dropped, and the job would sit until the reaper expired it. The rule is
+      // deliberately narrow - only the same worker id, so a delivery reaching a
+      // *different* worker is still refused and the dead one's job is left to
+      // the reaper. Worker ids include the pid, so a restarted process does not
+      // inherit its predecessor's claims.
+      let reclaimed: typeof claimed | undefined;
+      if (!claimed && typeof workerId === "string") {
+        [reclaimed] = await systemDb
+          .update(jobs)
+          .set({ startedAt: sql`NOW()` })
+          .where(and(eq(jobs.id, jobId), eq(jobs.status, "PROCESSING"), eq(jobs.workerId, workerId)))
+          .returning();
+      }
+
+      const updated = claimed ?? reclaimed;
+
       if (!updated) {
         jobReportsRejected.inc({ reason: "not_pending" });
         return res.status(409).json({ error: "Job is not PENDING" });
@@ -196,8 +243,14 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
       // Queue wait: reservation to claim. This is the number to autoscale on -
       // it rises before anything else visibly breaks, and unlike queue depth it
       // is denominated in what the customer actually experiences.
-      await recordQueueWait(updated.organizationId, updated.createdAt, updated.startedAt);
-      jobReports.inc({ status: "PROCESSING" });
+      //
+      // Only on a first claim. Measuring it again on a retry would fold the
+      // backoff delay into the queue wait and make the metric read as a
+      // capacity problem.
+      if (claimed) {
+        await recordQueueWait(claimed.organizationId, claimed.createdAt, claimed.startedAt);
+      }
+      jobReports.inc({ status: claimed ? "PROCESSING" : "PROCESSING_RECLAIM" });
 
       await publishJobEvent(updated.organizationId, "JOB_STATUS_CHANGE", {
         jobId,
@@ -399,18 +452,52 @@ router.get("/logs", async (req: AuthenticatedRequest, res: Response) => {
   // is withdrawn. Backed by idx_jobs_model_version.
   const modelVersion = typeof req.query.modelVersion === "string" ? req.query.modelVersion : null;
 
+  const requested = Number(req.query.limit);
+  const limit = Number.isFinite(requested)
+    ? Math.min(Math.max(Math.trunc(requested), 1), MAX_LOG_PAGE)
+    : DEFAULT_LOG_PAGE;
+
+  const cursor = typeof req.query.cursor === "string" ? decodeCursor(req.query.cursor) : null;
+  if (req.query.cursor && !cursor) {
+    return res.status(400).json({ error: "Malformed cursor" });
+  }
+
   try {
-    const logs = await withTenant(orgId, (tx) =>
+    // Keyset pagination, not OFFSET.
+    //
+    // This table only grows, and the specification keeps it forever. OFFSET
+    // makes the database walk and discard every skipped row, so the last page
+    // of a long-lived tenant costs the most - and any job created mid-scroll
+    // shifts every subsequent page by one, silently duplicating or skipping a
+    // row. Seeking on (created_at, id) is stable under insertion and reads only
+    // the page asked for.
+    const page = await withTenant(orgId, (tx) =>
       tx.query.jobs.findMany({
-        where: modelVersion
-          ? and(eq(jobs.organizationId, orgId), eq(jobs.modelVersion, modelVersion))
-          : eq(jobs.organizationId, orgId),
-        orderBy: (jobs, { desc }) => [desc(jobs.createdAt)],
+        where: and(
+          eq(jobs.organizationId, orgId),
+          ...(modelVersion ? [eq(jobs.modelVersion, modelVersion)] : []),
+          // The id tiebreaks jobs sharing a timestamp, which two requests in
+          // the same millisecond will.
+          ...(cursor
+            ? [sql`(${jobs.createdAt}, ${jobs.id}) < (${cursor.createdAt}, ${cursor.id})`]
+            : [])
+        ),
+        orderBy: (jobs, { desc }) => [desc(jobs.createdAt), desc(jobs.id)],
+        // One extra row answers "is there more" without a second count query.
+        limit: limit + 1,
       })
     );
 
-    return res.status(200).json({ logs });
+    const hasMore = page.length > limit;
+    const logs = hasMore ? page.slice(0, limit) : page;
+    const last = logs[logs.length - 1];
+
+    return res.status(200).json({
+      logs,
+      nextCursor: hasMore && last ? encodeCursor(last.createdAt, last.id) : null,
+    });
   } catch (error) {
+    console.error("Failed to fetch logs:", error);
     return res.status(500).json({ error: "Failed to fetch logs" });
   }
 });
@@ -424,29 +511,51 @@ router.post("/:jobId/trigger", async (req: AuthenticatedRequest, res: Response) 
   const orgId = req.user!.organizationId;
 
   try {
+    // Claim the right to dispatch, rather than checking for it.
+    //
+    // The old shape was read, check status, publish - with nothing holding the
+    // job still in between, so two concurrent triggers both saw PENDING and
+    // both published. Only one caller can win this UPDATE, and only the winner
+    // reaches the publish below.
     const found = await withTenant(orgId, async (tx) => {
-      const job = await tx.query.jobs.findFirst({
-        where: and(
-          eq(jobs.id, jobId),
-          eq(jobs.organizationId, orgId)
-        ),
-      });
+      const [claimed] = await tx
+        .update(jobs)
+        .set({ dispatchedAt: sql`NOW()` })
+        .where(
+          and(
+            eq(jobs.id, jobId),
+            eq(jobs.organizationId, orgId),
+            eq(jobs.status, "PENDING"),
+            isNull(jobs.dispatchedAt)
+          )
+        )
+        .returning();
+
+      // Only read the row back when the claim failed, to say why.
+      const existing = claimed
+        ? claimed
+        : await tx.query.jobs.findFirst({
+            where: and(eq(jobs.id, jobId), eq(jobs.organizationId, orgId)),
+          });
 
       const org = await tx.query.organizations.findFirst({
         where: eq(organizations.id, orgId),
       });
 
-      return { job, org };
+      return { job: claimed, existing, org };
     });
 
-    const { job, org } = found;
+    const { job, existing, org } = found;
 
     if (!job) {
-      return res.status(404).json({ error: "Job record not found." });
-    }
-
-    if (job.status !== "PENDING") {
-      return res.status(400).json({ error: `Job has already been dispatched. Current status: ${job.status}` });
+      if (!existing) {
+        return res.status(404).json({ error: "Job record not found." });
+      }
+      // Already dispatched, or already past PENDING. Same answer either way:
+      // this caller is not the one that gets to queue it.
+      return res.status(400).json({
+        error: `Job has already been dispatched. Current status: ${existing.status}`,
+      });
     }
 
     // Determine target queue from the organization's infrastructure tier.
@@ -456,12 +565,22 @@ router.post("/:jobId/trigger", async (req: AuthenticatedRequest, res: Response) 
     // Publish task message to RabbitMQ queue. The correlation id travels with
     // it, so the worker's log lines and its report back to the API carry the
     // same id as the browser request that dispatched the job.
-    await publishJob(queueName, {
-      jobId: job.id,
-      orgId: orgId,
-      s3Key: job.rawImageS3Key,
-      requestId: req.requestId,
-    });
+    try {
+      await publishJob(queueName, {
+        jobId: job.id,
+        orgId: orgId,
+        s3Key: job.rawImageS3Key,
+        requestId: req.requestId,
+      });
+    } catch (publishError) {
+      // The claim is released so the caller can try again. Left set, a broker
+      // hiccup would strand the job in PENDING until the reaper expired it -
+      // trading a rare double-dispatch for a routine dropped one.
+      await withTenant(orgId, (tx) =>
+        tx.update(jobs).set({ dispatchedAt: null }).where(eq(jobs.id, job.id))
+      );
+      throw publishError;
+    }
 
     return res.status(202).json({
       message: "Job successfully queued for processing",

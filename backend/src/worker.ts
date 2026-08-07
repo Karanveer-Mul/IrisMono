@@ -5,7 +5,7 @@ import * as http from "http";
 import * as os from "os";
 import * as path from "path";
 import { randomUUID } from "crypto";
-import { assertTopology, QUEUES } from "./queue";
+import { assertTopology, QUEUES, scheduleRetry } from "./queue";
 import { CONTENT_TYPE } from "./observability/metrics";
 import {
   busy,
@@ -14,6 +14,7 @@ import {
   messagesConsumed,
   modelDuration,
   reportFailures,
+  retriesScheduled,
   workerRegistry,
 } from "./observability/workerMetrics";
 import { currentRequestId, logger, withRequestContext } from "./observability/logger";
@@ -216,10 +217,10 @@ async function handleMessage(
   // or a fresh one if the message predates correlation. Everything logged for
   // the rest of this handler carries it.
   const correlationId = msg.properties.correlationId || randomUUID();
-  return withRequestContext(correlationId, () => processMessage(channel, msg));
+  return withRequestContext(correlationId, () => processMessage(channel, msg, queue));
 }
 
-async function processMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage) {
+async function processMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage, queue: string) {
   let jobId: string | undefined;
 
   try {
@@ -316,13 +317,31 @@ async function processMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage) {
       }
     }
 
-    // Outcome not recorded. Do not requeue: retries already happened in-process,
-    // and an endless redelivery loop would spin hot while the API is down.
-    // Dead-letter it instead, so the message survives for inspection and the
-    // reaper reclaims the credit once the job ages out.
+    // Outcome not recorded. Never requeue immediately - that spins hot against
+    // whatever is broken. Park it in the next delay tier instead, which is a
+    // redelivery the message pays for by waiting.
+    const retry = scheduleRetry(channel, queue, msg);
+
+    if (retry.retried) {
+      retriesScheduled.inc({ attempt: String(retry.attempt) });
+      logger.warn("Retrying job after backoff", {
+        jobId: jobId ?? "<unparseable>",
+        attempt: retry.attempt,
+        delayMs: retry.delayMs,
+      });
+      // Acknowledging the original is what removes it from the work queue; the
+      // copy now living in the delay queue is the one that comes back.
+      channel.ack(msg);
+      return;
+    }
+
+    // Out of tries. Dead-letter it, so the message survives for inspection and
+    // the reaper reclaims the credit once the job ages out.
     deadLettered.inc();
     jobsFinished.inc({ outcome: "dead_lettered" });
-    logger.error("Dead-lettering job", { jobId: jobId ?? "<unparseable>" });
+    logger.error("Dead-lettering job after exhausting retries", {
+      jobId: jobId ?? "<unparseable>",
+    });
     channel.nack(msg, false, false);
 
   } finally {

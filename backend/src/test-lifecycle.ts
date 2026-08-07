@@ -14,7 +14,15 @@ import * as amqp from "amqplib";
 import { sql } from "drizzle-orm";
 import { systemDb, pool, authPool, adminPool } from "./db";
 import { reapStaleJobs } from "./reaper";
-import { QUEUES, deadLetterQueueFor } from "./queue";
+import { grantCredits } from "./credits";
+import {
+  QUEUES,
+  RETRY_COUNT_HEADER,
+  RETRY_DELAYS_MS,
+  deadLetterQueueFor,
+  retryQueueFor,
+  scheduleRetry,
+} from "./queue";
 
 const API = "http://localhost:3000/api";
 const AMQP_URL = process.env.AMQP_URL || "amqp://guest:guest@localhost:5672";
@@ -118,15 +126,41 @@ async function run() {
   assert(await balanceOf(org.orgId) === 3, "a second sweep refunded again");
 
   // ---------------------------------------------------------------
-  console.log("\n4. Unprocessable message is dead-lettered, not discarded");
+  console.log("\n4. Unprocessable message is retried before it is dead-lettered");
   const conn = await amqp.connect(AMQP_URL);
   const ch = await conn.createChannel();
 
   const dlqName = deadLetterQueueFor(QUEUES.STANDARD);
+  const firstRetryQueue = retryQueueFor(QUEUES.STANDARD, 1);
   const before = (await ch.checkQueue(dlqName)).messageCount;
+  const retryBefore = (await ch.checkQueue(firstRetryQueue)).messageCount;
 
+  // A message whose outcome cannot be established no longer goes straight to
+  // the dead-letter queue - it is parked in the first delay tier, because the
+  // usual cause is a dependency that is briefly unavailable.
   ch.sendToQueue(QUEUES.STANDARD, Buffer.from(JSON.stringify({ nothing: "useful" })), {
     persistent: true,
+  });
+
+  let parkedNow = retryBefore;
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    parkedNow = (await ch.checkQueue(firstRetryQueue)).messageCount;
+    if (parkedNow > retryBefore) break;
+  }
+  console.log(`   -> ${firstRetryQueue}: ${retryBefore} -> ${parkedNow}`);
+  assert(parkedNow === retryBefore + 1, "message was not held for retry");
+  assert(
+    (await ch.checkQueue(dlqName)).messageCount === before,
+    "message was dead-lettered on its first failure"
+  );
+
+  // The same message arriving with its tiers already spent has nowhere left to
+  // go, and only then is it dead-lettered. Asserted by pre-setting the header
+  // rather than by waiting out every tier in sequence.
+  ch.sendToQueue(QUEUES.STANDARD, Buffer.from(JSON.stringify({ nothing: "useful" })), {
+    persistent: true,
+    headers: { [RETRY_COUNT_HEADER]: RETRY_DELAYS_MS.length },
   });
 
   let after = before;
@@ -135,8 +169,11 @@ async function run() {
     after = (await ch.checkQueue(dlqName)).messageCount;
     if (after > before) break;
   }
-  console.log(`   -> ${dlqName}: ${before} -> ${after}`);
-  assert(after === before + 1, "message was not dead-lettered");
+  console.log(`   -> ${dlqName}: ${before} -> ${after} once the tiers are spent`);
+  assert(after === before + 1, "an exhausted message was not dead-lettered");
+
+  // Do not leave the parked message to reappear on the work queue mid-suite.
+  await ch.purgeQueue(firstRetryQueue);
 
   // ---------------------------------------------------------------
   console.log("\n5. VIP tenants route to the VIP queue");
@@ -206,6 +243,149 @@ async function run() {
   const recalled = (await recall.json()).logs as any[];
   console.log(`   -> recall query returned ${recalled.length} job(s)`);
   assert(recalled.length === 1 && recalled[0].id === orphan, "recall query did not isolate the affected job");
+
+  // ---------------------------------------------------------------
+  console.log("\n8. Dispatch is single-shot under concurrent triggers");
+  // Two clicks, or a retried fetch. Both used to see PENDING and both used to
+  // publish, so a worker picked up a message that could only ever be refused.
+  const contested = await reserveJob(org.token);
+  const vipDepthBefore = (await ch.checkQueue(QUEUES.VIP)).messageCount;
+
+  const triggerOnce = () =>
+    fetch(`${API}/jobs/${contested}/trigger`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${org.token}` },
+    });
+
+  const [a, b] = await Promise.all([triggerOnce(), triggerOnce()]);
+  const accepted = [a.status, b.status].filter((s) => s === 202).length;
+  const refused = [a.status, b.status].filter((s) => s === 400).length;
+  await new Promise((r) => setTimeout(r, 500));
+  const vipDepthAfter = (await ch.checkQueue(QUEUES.VIP)).messageCount;
+
+  console.log(`   -> ${accepted} accepted, ${refused} refused; queue depth ${vipDepthBefore} -> ${vipDepthAfter}`);
+  assert(accepted === 1, `expected exactly one trigger to win, got ${accepted}`);
+  assert(refused === 1, "the losing trigger was not refused");
+  assert(vipDepthAfter === vipDepthBefore + 1, "the job was published more than once");
+
+  const dispatchRow = await systemDb.execute(
+    sql`SELECT dispatched_at FROM jobs WHERE id = ${contested}`
+  );
+  assert(
+    (dispatchRow.rows[0] as any).dispatched_at !== null,
+    "the winning trigger did not record when it dispatched"
+  );
+
+  // ---------------------------------------------------------------
+  console.log("\n9. Retry tiers hold a message and return it to its work queue");
+  // The delay queues have no consumer: a message sits until its TTL expires,
+  // and RabbitMQ dead-letters it back to the queue it came from. That expiry is
+  // the redelivery, so this asserts the mechanism rather than the wiring.
+  const retryQueue = retryQueueFor(QUEUES.VIP, 1);
+  const delayMs = RETRY_DELAYS_MS[0];
+  await ch.purgeQueue(QUEUES.VIP);
+
+  ch.sendToQueue(retryQueue, Buffer.from(JSON.stringify({ jobId: "retry-probe", orgId: org.orgId })), {
+    persistent: true,
+    headers: { [RETRY_COUNT_HEADER]: 1 },
+  });
+
+  await new Promise((r) => setTimeout(r, 800));
+  const parked = (await ch.checkQueue(retryQueue)).messageCount;
+  const notYet = (await ch.checkQueue(QUEUES.VIP)).messageCount;
+  console.log(`   -> after 0.8s: ${parked} parked, ${notYet} back on the work queue`);
+  assert(parked === 1, "the message was not held in the delay queue");
+  assert(notYet === 0, "the message returned before its delay elapsed");
+
+  console.log(`   waiting out the ${delayMs / 1000}s tier...`);
+  await new Promise((r) => setTimeout(r, delayMs + 2000));
+  const returned = (await ch.checkQueue(QUEUES.VIP)).messageCount;
+  console.log(`   -> after the TTL: ${returned} back on ${QUEUES.VIP}`);
+  assert(returned === 1, "the message never came back from the delay queue");
+
+  // ---------------------------------------------------------------
+  console.log("\n10. Retries are bounded, and the last one dead-letters");
+  // scheduleRetry is pure with respect to the channel, so exhaustion is checked
+  // directly rather than by waiting out every tier in sequence.
+  const published: string[] = [];
+  const fakeChannel = {
+    sendToQueue: (queue: string) => {
+      published.push(queue);
+      return true;
+    },
+  } as unknown as amqp.Channel;
+
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    const message = {
+      content: Buffer.from("{}"),
+      properties: { headers: { [RETRY_COUNT_HEADER]: attempt } },
+    } as unknown as amqp.ConsumeMessage;
+
+    const result = scheduleRetry(fakeChannel, QUEUES.STANDARD, message);
+    if (attempt < RETRY_DELAYS_MS.length) {
+      assert(result.retried, `attempt ${attempt + 1} should have been scheduled`);
+    } else {
+      assert(!result.retried, "a message was retried past the last tier");
+    }
+  }
+  console.log(`   -> ${RETRY_DELAYS_MS.length} tiers scheduled, then exhausted`);
+  assert(published.length === RETRY_DELAYS_MS.length, "wrong number of retries scheduled");
+  assert(
+    published[published.length - 1] === retryQueueFor(QUEUES.STANDARD, RETRY_DELAYS_MS.length),
+    "the last retry did not use the longest tier"
+  );
+
+  // ---------------------------------------------------------------
+  console.log("\n11. The audit log pages by cursor, without overlap");
+  const firstPage = await (
+    await fetch(`${API}/jobs/logs?limit=2`, { headers: { Authorization: `Bearer ${org.token}` } })
+  ).json();
+  console.log(`   -> page 1: ${firstPage.logs.length} row(s), cursor ${firstPage.nextCursor ? "present" : "null"}`);
+  assert(firstPage.logs.length === 2, "the page size was not honoured");
+  assert(!!firstPage.nextCursor, "no cursor was returned despite more rows existing");
+
+  const secondPage = await (
+    await fetch(`${API}/jobs/logs?limit=2&cursor=${encodeURIComponent(firstPage.nextCursor)}`, {
+      headers: { Authorization: `Bearer ${org.token}` },
+    })
+  ).json();
+  const firstIds = firstPage.logs.map((j: any) => j.id);
+  const secondIds = secondPage.logs.map((j: any) => j.id);
+  console.log(`   -> page 2: ${secondIds.length} row(s), ${secondIds.filter((id: string) => firstIds.includes(id)).length} overlapping`);
+  assert(secondIds.every((id: string) => !firstIds.includes(id)), "a row appeared on two pages");
+  assert(
+    new Date(secondPage.logs[0].createdAt) <= new Date(firstPage.logs[1].createdAt),
+    "the second page is not older than the first"
+  );
+
+  const malformed = await fetch(`${API}/jobs/logs?cursor=not-a-cursor`, {
+    headers: { Authorization: `Bearer ${org.token}` },
+  });
+  console.log(`   -> malformed cursor: HTTP ${malformed.status}`);
+  assert(malformed.status === 400, "a malformed cursor was not rejected");
+
+  // ---------------------------------------------------------------
+  console.log("\n12. A redelivered job can be re-claimed by its own worker only");
+  // Without this the retry tiers would be decorative: the first attempt leaves
+  // the job PROCESSING, so the redelivered copy would be refused and dropped.
+  // Earlier steps spent the trial credits. Topped up through the ledger rather
+  // than by writing the balance column, so reconciliation still holds.
+  await grantCredits(systemDb, org.orgId, 1, "MANUAL_ADJUSTMENT", "lifecycle test top-up");
+
+  const reclaimJob = await reserveJob(org.token);
+  const claim = (workerId: string) =>
+    fetch(`${API}/jobs/${reclaimJob}/report`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SECRET },
+      body: JSON.stringify({ status: "PROCESSING", workerId }),
+    });
+
+  assert((await claim("worker-a")).status === 200, "the first claim was refused");
+  const sameWorker = await claim("worker-a");
+  const otherWorker = await claim("worker-b");
+  console.log(`   -> same worker: ${sameWorker.status}, different worker: ${otherWorker.status}`);
+  assert(sameWorker.status === 200, "a worker could not re-claim its own job after redelivery");
+  assert(otherWorker.status === 409, "a second worker was allowed to take a job already in flight");
 
   // Leave the broker as we found it.
   await ch.purgeQueue(QUEUES.VIP);
