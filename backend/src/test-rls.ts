@@ -11,7 +11,7 @@
  */
 import { eq } from "drizzle-orm";
 import { db, systemDb, withTenant, pool, authPool, adminPool } from "./db";
-import { jobs, users, organizationInvites, organizations } from "./db/schema";
+import { jobs, users, memberships, organizationInvites, organizations } from "./db/schema";
 
 const API = "http://localhost:3000/api";
 
@@ -87,15 +87,19 @@ async function run() {
   const seenByA = await withTenant(a.orgId, async (tx) => ({
     jobs: await tx.select().from(jobs),
     users: await tx.select().from(users),
+    memberships: await tx.select().from(memberships),
     invites: await tx.select().from(organizationInvites),
     orgs: await tx.select().from(organizations),
   }));
   console.log(
     `-> jobs ${seenByA.jobs.length}, users ${seenByA.users.length}, ` +
-    `invites ${seenByA.invites.length}, orgs ${seenByA.orgs.length}`
+    `memberships ${seenByA.memberships.length}, invites ${seenByA.invites.length}, orgs ${seenByA.orgs.length}`
   );
   assert(seenByA.jobs.every((j) => j.organizationId === a.orgId), "tenant A saw another tenant's jobs");
-  assert(seenByA.users.every((u) => u.organizationId === a.orgId), "tenant A saw another tenant's users");
+  // users carries no tenant column now; its policy asks the membership table,
+  // so visibility follows who actually belongs to this organization.
+  assert(seenByA.memberships.every((m) => m.organizationId === a.orgId), "tenant A saw another tenant's memberships");
+  assert(seenByA.users.length === seenByA.memberships.length, "user visibility does not track membership");
   assert(seenByA.invites.every((i) => i.organizationId === a.orgId), "tenant A saw another tenant's invites");
   assert(seenByA.orgs.length === 1 && seenByA.orgs[0].id === a.orgId, "tenant A saw another organization");
   assert(seenByA.jobs.length < allJobs.length, "RLS did not actually filter anything");

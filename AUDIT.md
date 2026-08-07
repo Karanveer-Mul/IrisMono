@@ -96,7 +96,7 @@ Absent from the design entirely: encryption at rest (no KMS, no per-tenant keys)
 
 For a product whose entire market is hospitals, this is the largest gap in the document.
 
-### 2.7 The identity model is too rigid for real customers
+### 2.7 The identity model is too rigid for real customers *(resolved — see §7)*
 
 `users.organization_id` is a single nullable FK, `users.email` is globally unique, and `role` lives on the user row. Therefore:
 
@@ -316,7 +316,7 @@ Against `arch.md`. "Partial" means implemented with a material caveat documented
 | §1 | Real-time notification via SSE | ✅ | Stream-token auth, fanout across instances, `Last-Event-ID` replay — verified by `npm run test:sse` |
 | §1 | Configurable data retention / lifecycle rules | ✅ | `src/retention.ts`, `STORAGE_RETENTION_DAYS`; bucket lifecycle equivalent documented for real S3 |
 | §2 | Organization owns shared credit pool | ✅ | `schema.ts:9-16` |
-| §2 | Roles `ORG_ADMIN` / `MEMBER` | ⚠️ Partial | Enum + `requireRole` exist; enforced only on `/api/invites` |
+| §2 | Roles `ORG_ADMIN` / `MEMBER` | ✅ | Role now lives on the membership, so it is per organization — `memberships` table, migration `0007` |
 | §2 | S3 paths segregated by organization UUID | ✅ | `jobs.ts:99` — `org_id=<uuid>/jobs/<uuid>/raw.png` |
 | §2 | Schema ready for RLS on `organization_id` | ✅ | Enforced, not merely ready: migration `0002`, `withTenant()` in `src/db/index.ts`, regression test `npm run test:rls` |
 | §3 | First signup creates org + grants `ORG_ADMIN` | ✅ | `auth.ts:41-77` |
@@ -363,6 +363,7 @@ npm run test:lifecycle   # reaper, dead-lettering, tier routing
 npm run test:credits     # ledger integrity, refund idempotency, reconciliation
 # test:sse needs a second instance: PORT=3002 npx tsx src/index.ts
 npm run test:sse         # cross-instance delivery and Last-Event-ID replay
+npm run test:identity    # one account across organizations, role per membership
 ```
 
 ### How RLS was implemented
@@ -429,7 +430,23 @@ Recording the event and pushing it are deliberately not atomic. The append is wh
 
 `npm run test:sse` is the proof, and it needs two API instances (`PORT=3002 npx tsx src/index.ts`) — a single-process test could not distinguish this from the old hub. It asserts that an event published on instance B reaches a client connected to instance A, that a job completed while the client was disconnected is replayed on reconnect, that already-seen events are not resent, and that live delivery resumes afterwards.
 
-**Status update.** All eight defect fixes have been applied, plus the credit ledger, job provenance, and SSE bus from the design critique. Six suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, `test:sse`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+### Identity model (design item §2.7)
+
+Migration `0007` introduces `memberships (user_id, organization_id, role)`, backfills every existing user into it (47 rows), and then **drops `users.organization_id` and `users.role`**. Dropping them is the point: leaving them would let code keep reading "the" organization for a user, which is exactly the assumption being removed.
+
+A user is now a person, not a seat. The same account can be `ORG_ADMIN` at their own practice and `MEMBER` at a hospital, which is the normal case for consulting radiologists and multi-site networks rather than an edge case.
+
+**Sessions stay scoped to one organization.** The JWT still carries a single `organizationId` and `role`, so every downstream route reads `req.user.organizationId` unchanged and the RLS context remains one unambiguous value per request. Switching is `POST /auth/switch-organization`, which re-checks the membership server-side and mints a new token — a token cannot be minted for a tenant the caller does not belong to.
+
+**Joining while already registered now works.** Previously a known email was a flat 409. It now adds a membership, once the password proves who is asking — an email address alone cannot attach someone else's account to your organization.
+
+**The `users` RLS policy had to change shape**, because the table no longer carries a tenant. It now asks the membership table: a user row is visible to exactly those organizations the person belongs to. `test:rls` asserts user visibility tracks membership count, and `test:identity` confirms an unrelated organization reads zero rows for a person it does not employ.
+
+The dashboard header becomes an organization switcher when there is more than one membership; the component is remounted on change so no state from the previous tenant survives.
+
+`npm run test:identity` covers the whole shape: one account in two organizations with different roles, a single `users` row rather than a duplicate, an impostor with the wrong password refused, admin powers *not* travelling between organizations (`ORG_ADMIN` in one, 403 on the same admin action in the other), switching refused for non-members, membership lists isolated per tenant, and removing one membership leaving the account and the other membership intact.
+
+**Status update.** All eight defect fixes have been applied, plus four items from the design critique — the credit ledger, job provenance, the SSE bus, and the identity model. Seven suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, `test:sse`, `test:identity`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 

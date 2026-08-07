@@ -50,6 +50,13 @@
       "when": 1786000500000,
       "tag": "0006_job_events",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786000600000,
+      "tag": "0007_memberships",
+      "breakpoints": true
     }
   ]
 }

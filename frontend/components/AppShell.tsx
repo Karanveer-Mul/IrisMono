@@ -41,7 +41,16 @@ export function AppShell({ initialInviteCode }: AppShellProps) {
   }
 
   if (user) {
-    return <Dashboard user={user} onLogout={() => setUser(null)} />;
+    return (
+      <Dashboard
+        // Remount on tenant change so no state from the previous organization
+        // survives the switch.
+        key={user.organizationId}
+        user={user}
+        onLogout={() => setUser(null)}
+        onSwitchOrganization={setUser}
+      />
+    );
   }
 
   return <Auth onAuthSuccess={setUser} initialInviteCode={initialInviteCode} />;

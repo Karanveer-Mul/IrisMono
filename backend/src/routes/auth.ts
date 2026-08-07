@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 // organization context exists (by email, or by invite code), so they run on the
 // RLS-bypassing system identity. Everything with a known tenant uses withTenant.
 import { systemDb, withTenant } from "../db";
-import { organizations, users, organizationInvites } from "../db/schema";
+import { organizations, users, memberships, organizationInvites } from "../db/schema";
 import { eq, and } from "drizzle-orm";
 import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
@@ -18,9 +18,50 @@ const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-chan
 const TRIAL_CREDITS = 3;
 
 /**
+ * A session token is scoped to ONE organization - the one the user is currently
+ * acting in. A person may belong to several; switching is a new token, issued by
+ * POST /switch-organization after verifying the membership.
+ *
+ * Keeping the active tenant in the token is what lets every downstream route go
+ * on reading req.user.organizationId, and what keeps the RLS context a single
+ * unambiguous value per request.
+ */
+function issueSessionToken(user: { id: string; email: string }, orgId: string, role: "ORG_ADMIN" | "MEMBER") {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      organizationId: orgId,
+      role,
+    },
+    JWT_SECRET,
+    { expiresIn: "24h" }
+  );
+}
+
+/** Every organization this person belongs to, with their role in each. */
+async function membershipsOf(userId: string) {
+  const rows = await systemDb
+    .select({
+      organizationId: memberships.organizationId,
+      role: memberships.role,
+      organizationName: organizations.name,
+    })
+    .from(memberships)
+    .innerJoin(organizations, eq(memberships.organizationId, organizations.id))
+    .where(eq(memberships.userId, userId));
+
+  return rows;
+}
+
+/**
  * 1. First-In Creator Signup
- * Automatically creates a new Organization, seeds it with 3 trial credits, 
- * sets the allowed domain to the creator's email domain, and grants them ORG_ADMIN role.
+ * Creates a new Organization, seeds it with trial credits, sets the allowed
+ * domain to the creator's email domain, and makes them its ORG_ADMIN.
+ *
+ * An existing account may also create an additional workspace: the email is
+ * already known, so the password authenticates the person rather than
+ * registering a new one.
  */
 router.post("/register", async (req: Request, res: Response) => {
   const { email, password, orgName } = req.body;
@@ -30,26 +71,28 @@ router.post("/register", async (req: Request, res: Response) => {
   }
 
   try {
-    // Check if user already exists
-    const existingUser = await systemDb.query.users.findFirst({
-      where: eq(users.email, email),
-    });
-
-    if (existingUser) {
-      return res.status(409).json({ error: "Email is already registered" });
-    }
-
     const creatorDomain = getEmailDomain(email);
     if (!creatorDomain) {
       return res.status(400).json({ error: "Invalid email domain" });
     }
 
-    // Start database transaction
-    const token = await systemDb.transaction(async (tx) => {
-      // 1. Create Organization with the creator's domain whitelisted. The
-      // balance starts at zero and the trial credits arrive as a ledger entry
-      // below, so every credit this organization ever holds has a recorded
-      // origin.
+    const existingUser = await systemDb.query.users.findFirst({
+      where: eq(users.email, email),
+    });
+
+    // A known email means an existing person creating another workspace, which
+    // must be authenticated - otherwise anyone could attach workspaces to
+    // someone else's account.
+    if (existingUser) {
+      const isMatch = await bcrypt.compare(password, existingUser.passwordHash);
+      if (!isMatch) {
+        return res.status(409).json({
+          error: "Email is already registered. Sign in to create an additional workspace.",
+        });
+      }
+    }
+
+    const result = await systemDb.transaction(async (tx) => {
       const [newOrg] = await tx
         .insert(organizations)
         .values({
@@ -61,35 +104,26 @@ router.post("/register", async (req: Request, res: Response) => {
 
       await grantCredits(tx, newOrg.id, TRIAL_CREDITS, "TRIAL_GRANT", "New workspace trial credits");
 
-      // 2. Hash Password
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(password, salt);
+      let user = existingUser;
+      if (!user) {
+        const salt = await bcrypt.genSalt(10);
+        const passwordHash = await bcrypt.hash(password, salt);
+        [user] = await tx.insert(users).values({ email, passwordHash }).returning();
+      }
 
-      // 3. Create User as ORG_ADMIN
-      const [newUser] = await tx
-        .insert(users)
-        .values({
-          email,
-          passwordHash,
-          organizationId: newOrg.id,
-          role: "ORG_ADMIN",
-        })
-        .returning();
+      await tx.insert(memberships).values({
+        userId: user!.id,
+        organizationId: newOrg.id,
+        role: "ORG_ADMIN",
+      });
 
-      // 4. Generate JWT
-      return jwt.sign(
-        {
-          id: newUser.id,
-          email: newUser.email,
-          organizationId: newOrg.id,
-          role: "ORG_ADMIN",
-        },
-        JWT_SECRET,
-        { expiresIn: "24h" }
-      );
+      return { token: issueSessionToken(user!, newOrg.id, "ORG_ADMIN"), userId: user!.id };
     });
 
-    return res.status(201).json({ token });
+    return res.status(201).json({
+      token: result.token,
+      memberships: await membershipsOf(result.userId),
+    });
 
   } catch (error) {
     console.error("Registration error:", error);
@@ -99,7 +133,11 @@ router.post("/register", async (req: Request, res: Response) => {
 
 /**
  * 2. Join Organization via Invite Link
- * Validates domain whitelists and assigns MEMBER role.
+ * Validates the domain whitelist and adds a MEMBER membership.
+ *
+ * An existing account joining a second organization is the normal case here -
+ * a consulting radiologist working across hospitals - so a known email adds a
+ * membership rather than being refused, once the password proves who they are.
  */
 router.post("/join/:inviteCode", async (req: Request, res: Response) => {
   const { inviteCode } = req.params;
@@ -110,7 +148,6 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
   }
 
   try {
-    // 1. Query invite code
     const invite = await systemDb.query.organizationInvites.findFirst({
       where: eq(organizationInvites.inviteCode, inviteCode),
     });
@@ -127,8 +164,8 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
       return res.status(410).json({ error: "This invite link has expired" });
     }
 
-    // 2. Hospital-grade Domain Whitelist Enforcement
-    // Check invite whitelist first, then fallback to organization allowed domains
+    // Hospital-grade domain whitelist enforcement. Invite whitelist first, then
+    // the organization's.
     let allowedDomains = invite.allowedDomains;
     if (!allowedDomains || allowedDomains.length === 0) {
       const org = await systemDb.query.organizations.findFirst({
@@ -137,50 +174,57 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
       allowedDomains = org?.allowedDomains || [];
     }
 
-    const domainAllowed = isEmailDomainAllowed(email, allowedDomains);
-    if (!domainAllowed) {
+    if (!isEmailDomainAllowed(email, allowedDomains)) {
       return res.status(403).json({
         error: `Registration denied. Your email domain is not authorized for this organization. Whitelist includes: ${allowedDomains.join(", ")}`,
       });
     }
 
-    // Check if user already exists
     const existingUser = await systemDb.query.users.findFirst({
       where: eq(users.email, email),
     });
 
     if (existingUser) {
-      return res.status(409).json({ error: "Email is already registered" });
+      const isMatch = await bcrypt.compare(password, existingUser.passwordHash);
+      if (!isMatch) {
+        return res.status(401).json({
+          error: "This email already has an account. Use its password to join this organization.",
+        });
+      }
+
+      const already = await systemDb.query.memberships.findFirst({
+        where: and(
+          eq(memberships.userId, existingUser.id),
+          eq(memberships.organizationId, invite.organizationId)
+        ),
+      });
+
+      if (already) {
+        return res.status(409).json({ error: "You are already a member of this organization" });
+      }
     }
 
-    // 3. Create User as MEMBER under transaction
-    const token = await systemDb.transaction(async (tx) => {
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(password, salt);
+    const result = await systemDb.transaction(async (tx) => {
+      let user = existingUser;
+      if (!user) {
+        const salt = await bcrypt.genSalt(10);
+        const passwordHash = await bcrypt.hash(password, salt);
+        [user] = await tx.insert(users).values({ email, passwordHash }).returning();
+      }
 
-      const [newUser] = await tx
-        .insert(users)
-        .values({
-          email,
-          passwordHash,
-          organizationId: invite.organizationId,
-          role: "MEMBER",
-        })
-        .returning();
+      await tx.insert(memberships).values({
+        userId: user!.id,
+        organizationId: invite.organizationId,
+        role: "MEMBER",
+      });
 
-      return jwt.sign(
-        {
-          id: newUser.id,
-          email: newUser.email,
-          organizationId: invite.organizationId,
-          role: "MEMBER",
-        },
-        JWT_SECRET,
-        { expiresIn: "24h" }
-      );
+      return { token: issueSessionToken(user!, invite.organizationId, "MEMBER"), userId: user!.id };
     });
 
-    return res.status(201).json({ token });
+    return res.status(201).json({
+      token: result.token,
+      memberships: await membershipsOf(result.userId),
+    });
 
   } catch (error) {
     console.error("Invite join error:", error);
@@ -190,6 +234,9 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
 
 /**
  * 3. Standard Login
+ *
+ * Signs in to the first organization the person belongs to, and returns the
+ * full list so a client can offer a switcher.
  */
 router.post("/login", async (req: Request, res: Response) => {
   const { email, password } = req.body;
@@ -212,18 +259,20 @@ router.post("/login", async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        organizationId: user.organizationId,
-        role: user.role,
-      },
-      JWT_SECRET,
-      { expiresIn: "24h" }
-    );
+    const list = await membershipsOf(user.id);
 
-    return res.status(200).json({ token });
+    if (list.length === 0) {
+      return res.status(403).json({
+        error: "This account does not belong to any organization. Ask an administrator for an invite link.",
+      });
+    }
+
+    const active = list[0];
+
+    return res.status(200).json({
+      token: issueSessionToken(user, active.organizationId, active.role),
+      memberships: list,
+    });
 
   } catch (error) {
     console.error("Login error:", error);
@@ -237,28 +286,29 @@ router.post("/login", async (req: Request, res: Response) => {
 router.get("/profile", authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
   const userId = req.user!.id;
   const orgId = req.user!.organizationId;
+
   try {
     // Tenant context is known here, so this runs under RLS.
-    const user = await withTenant(orgId, (tx) =>
-      tx.query.users.findFirst({
-        where: eq(users.id, userId),
-        with: {
-          organization: true,
-        },
-      })
-    );
+    const data = await withTenant(orgId, async (tx) => {
+      const user = await tx.query.users.findFirst({ where: eq(users.id, userId) });
+      const organization = await tx.query.organizations.findFirst({
+        where: eq(organizations.id, orgId),
+      });
+      return { user, organization };
+    });
 
-    if (!user) {
+    if (!data.user) {
       return res.status(404).json({ error: "User profile not found" });
     }
 
     return res.status(200).json({
       user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
+        id: data.user.id,
+        email: data.user.email,
+        role: req.user!.role,
       },
-      organization: user.organization,
+      organization: data.organization,
+      memberships: await membershipsOf(userId),
     });
   } catch (error) {
     console.error("Profile load error:", error);
@@ -267,7 +317,57 @@ router.get("/profile", authenticateJWT, async (req: AuthenticatedRequest, res: R
 });
 
 /**
- * 5. Mint a short-lived token for the SSE stream
+ * 5. List the organizations this person belongs to
+ */
+router.get("/memberships", authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    return res.status(200).json({ memberships: await membershipsOf(req.user!.id) });
+  } catch (error) {
+    console.error("Membership load error:", error);
+    return res.status(500).json({ error: "Failed to load organization memberships" });
+  }
+});
+
+/**
+ * 6. Switch the active organization
+ *
+ * Issues a token scoped to a different organization, but only one the caller
+ * actually belongs to - the membership is re-checked here rather than trusted
+ * from the request, so a token cannot be minted for an arbitrary tenant.
+ */
+router.post("/switch-organization", authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  const { organizationId } = req.body ?? {};
+  const userId = req.user!.id;
+
+  if (!organizationId) {
+    return res.status(400).json({ error: "Missing required field: organizationId" });
+  }
+
+  try {
+    const membership = await systemDb.query.memberships.findFirst({
+      where: and(eq(memberships.userId, userId), eq(memberships.organizationId, organizationId)),
+    });
+
+    if (!membership) {
+      return res.status(403).json({ error: "You are not a member of that organization" });
+    }
+
+    const user = await systemDb.query.users.findFirst({ where: eq(users.id, userId) });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    return res.status(200).json({
+      token: issueSessionToken(user, organizationId, membership.role),
+    });
+  } catch (error) {
+    console.error("Organization switch error:", error);
+    return res.status(500).json({ error: "Failed to switch organization" });
+  }
+});
+
+/**
+ * 7. Mint a short-lived token for the SSE stream
  *
  * EventSource cannot send an Authorization header, so the stream is
  * authenticated by query parameter instead. These tokens expire in 60 seconds

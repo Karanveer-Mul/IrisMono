@@ -28,14 +28,27 @@ export const organizations = pgTable("organizations", {
 });
 
 // 2. Users
+//
+// A user is a person, not a seat. Which organizations they belong to - and
+// what they can do in each - lives in memberships.
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
-  organizationId: uuid("organization_id").references(() => organizations.id, { onDelete: "cascade" }),
   email: varchar("email", { length: 255 }).unique().notNull(),
   passwordHash: varchar("password_hash", { length: 255 }).notNull(),
-  role: userRoleEnum("role").notNull().default("MEMBER"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// 2b. Memberships (user x organization x role)
+//
+// The role belongs to the relationship, so the same person can be ORG_ADMIN at
+// one hospital and MEMBER at another.
+export const memberships = pgTable("memberships", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+  role: userRoleEnum("role").notNull().default("MEMBER"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 // 3. Organization Invites
@@ -103,7 +116,7 @@ export const jobEvents = pgTable("job_events", {
 
 // Relations for ORM query building convenience
 export const organizationsRelations = relations(organizations, ({ many }) => ({
-  users: many(users),
+  memberships: many(memberships),
   invites: many(organizationInvites),
   jobs: many(jobs),
   creditTransactions: many(creditTransactions),
@@ -120,12 +133,20 @@ export const creditTransactionsRelations = relations(creditTransactions, ({ one 
   }),
 }));
 
-export const usersRelations = relations(users, ({ one, many }) => ({
+export const usersRelations = relations(users, ({ many }) => ({
+  memberships: many(memberships),
+  jobs: many(jobs),
+}));
+
+export const membershipsRelations = relations(memberships, ({ one }) => ({
+  user: one(users, {
+    fields: [memberships.userId],
+    references: [users.id],
+  }),
   organization: one(organizations, {
-    fields: [users.organizationId],
+    fields: [memberships.organizationId],
     references: [organizations.id],
   }),
-  jobs: many(jobs),
 }));
 
 export const organizationInvitesRelations = relations(organizationInvites, ({ one }) => ({

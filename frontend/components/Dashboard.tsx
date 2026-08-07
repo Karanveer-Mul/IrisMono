@@ -1,8 +1,8 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { apiFetch, removeToken } from "@/lib/api";
-import type { UserContext } from "@/lib/api";
+import { apiFetch, removeToken, setToken, decodeUserFromToken } from "@/lib/api";
+import type { UserContext, Membership } from "@/lib/api";
 import { MaskUploader } from "./MaskUploader";
 import { InviteManager } from "./InviteManager";
 import { LogOut, Coins, ShieldCheck, ClipboardList, Clock, Layers } from "lucide-react";
@@ -29,9 +29,12 @@ interface AuditLog {
 interface DashboardProps {
   user: UserContext;
   onLogout: () => void;
+  /** Re-scopes the session to another organization the user belongs to. */
+  onSwitchOrganization: (user: UserContext) => void;
 }
 
-export function Dashboard({ user, onLogout }: DashboardProps) {
+export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardProps) {
+  const [memberships, setMemberships] = useState<Membership[]>([]);
   const [org, setOrg] = useState<OrganizationInfo | null>(null);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [activeJob, setActiveJob] = useState<AuditLog | null>(null);
@@ -51,6 +54,8 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
       const profile = await apiFetch("/api/auth/profile");
 
       // Trigger glow animation if balance changed (spend or refund)
+      setMemberships(profile.memberships || []);
+
       setOrg((prev) => {
         if (prev && prev.creditBalance !== profile.organization.creditBalance) {
           setGlowCredits(true);
@@ -180,6 +185,29 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
     onLogout();
   };
 
+  /**
+   * Switching organizations exchanges the session token for one scoped to the
+   * other tenant. The server re-checks the membership, so this is a request
+   * rather than a client-side context change.
+   */
+  const handleSwitchOrganization = async (organizationId: string) => {
+    if (organizationId === user.organizationId) return;
+
+    try {
+      const res = await apiFetch("/api/auth/switch-organization", {
+        method: "POST",
+        body: { organizationId },
+      });
+      setToken(res.token);
+      const switched = decodeUserFromToken(res.token);
+      if (switched) {
+        onSwitchOrganization(switched);
+      }
+    } catch (err) {
+      console.error("Could not switch organization:", err);
+    }
+  };
+
   return (
     <div className="app-container">
 
@@ -192,12 +220,30 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
 
         <div className="header-right">
 
-          {/* Org details */}
+          {/* Active organization. A person may belong to several, so this
+              becomes a switcher once there is more than one. */}
           {org && (
             <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-              <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)", fontWeight: 500 }}>
-                {org.name}
-              </span>
+              {memberships.length > 1 ? (
+                <select
+                  id="org-switcher"
+                  className="input-field"
+                  style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem", width: "auto", maxWidth: "220px" }}
+                  value={user.organizationId}
+                  onChange={(e) => handleSwitchOrganization(e.target.value)}
+                  aria-label="Active organization"
+                >
+                  {memberships.map((m) => (
+                    <option key={m.organizationId} value={m.organizationId}>
+                      {m.organizationName}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)", fontWeight: 500 }}>
+                  {org.name}
+                </span>
+              )}
               <span className="badge badge-teal">
                 <ShieldCheck size={12} />
                 <span>{user.role}</span>

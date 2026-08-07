@@ -3,7 +3,15 @@ const TOKEN_KEY = "irismono_jwt_token";
 export interface UserContext {
   id: string;
   email: string;
+  /** The organization this session is currently acting in. */
   organizationId: string;
+  /** Role in that organization - a person may hold a different one elsewhere. */
+  role: "ORG_ADMIN" | "MEMBER";
+}
+
+export interface Membership {
+  organizationId: string;
+  organizationName: string;
   role: "ORG_ADMIN" | "MEMBER";
 }
 
