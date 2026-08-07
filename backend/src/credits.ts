@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { systemDb } from "./db";
+import { creditMovements } from "./observability/apiMetrics";
 
 /**
  * Credit movement.
@@ -58,6 +59,12 @@ export async function reserveCredit(tx: Executor, orgId: string, jobId: string) 
        SET credit_balance = credit_balance - 1, updated_at = NOW()
      WHERE id = ${orgId}
   `);
+
+  // Counted here rather than at the call sites, for the same reason the ledger
+  // row is written here: this is the only place a balance moves, so the metric
+  // cannot drift from what actually happened. Deliberately unlabelled by
+  // organization - tenant ids are unbounded cardinality.
+  creditMovements.inc({ reason: "JOB_RESERVATION" });
 }
 
 /**
@@ -90,6 +97,11 @@ export async function refundCredit(
      WHERE id = ${orgId}
   `);
 
+  // Only counted when a refund actually happened. A rising refund rate means
+  // the model is failing or workers are dying; a suppressed duplicate means
+  // idempotency did its job and is not a business event.
+  creditMovements.inc({ reason: "JOB_REFUND" });
+
   return true;
 }
 
@@ -116,6 +128,8 @@ export async function grantCredits(
        SET credit_balance = credit_balance + ${amount}, updated_at = NOW()
      WHERE id = ${orgId}
   `);
+
+  creditMovements.inc({ reason });
 }
 
 export interface Discrepancy {

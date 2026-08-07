@@ -30,6 +30,8 @@ export function deadLetterQueueFor(queue: string) {
 // amqplib >= 0.10.5 resolves connect() to ChannelModel, not Connection.
 let connection: amqp.ChannelModel | null = null;
 let channel: amqp.Channel | null = null;
+/** Set by closeQueue, so a deliberate close is not mistaken for an outage. */
+let shuttingDown = false;
 
 /**
  * Declares the dead-letter exchange, the per-tier work queues, and their
@@ -72,6 +74,10 @@ export async function initQueue() {
     });
 
     conn.on("close", () => {
+      if (shuttingDown) {
+        console.log("AMQP connection closed.");
+        return;
+      }
       console.log("AMQP Connection closed. Reconnecting...");
       reconnect();
     });
@@ -87,11 +93,14 @@ export async function initQueue() {
       );
     }
     console.error("Failed to connect to RabbitMQ:", err);
-    setTimeout(initQueue, 5000); // Retry connection
+    if (!shuttingDown) {
+      setTimeout(initQueue, 5000); // Retry connection
+    }
   }
 }
 
 async function reconnect() {
+  if (shuttingDown) return;
   connection = null;
   channel = null;
   await initQueue();
@@ -99,15 +108,63 @@ async function reconnect() {
 
 export async function publishJob(
   queueName: string,
-  message: { jobId: string; orgId: string; s3Key: string }
+  message: { jobId: string; orgId: string; s3Key: string; requestId?: string }
 ) {
   if (!channel) {
     throw new Error("Message broker channel not initialized");
   }
 
   const payload = Buffer.from(JSON.stringify(message));
-  channel.sendToQueue(queueName, payload, { persistent: true });
+  // The correlation id rides with the message so the worker's logs and its
+  // report back to the API join up with the browser request that started it.
+  channel.sendToQueue(queueName, payload, {
+    persistent: true,
+    correlationId: message.requestId,
+  });
   console.log(`Published job ${message.jobId} to queue: ${queueName}`);
 }
 
-export { connection, channel };
+/**
+ * Accessors rather than re-exported bindings.
+ *
+ * `export { channel }` publishes the value once, at module evaluation - when it
+ * is still null. Every consumer would see null forever, including after a
+ * successful reconnect.
+ */
+export function getChannel(): amqp.Channel | null {
+  return channel;
+}
+
+export function isBrokerConnected(): boolean {
+  return connection !== null && channel !== null;
+}
+
+/**
+ * A separate channel for queue inspection.
+ *
+ * checkQueue on a queue that does not exist makes RabbitMQ close the channel.
+ * Sampling depth on the publishing channel would therefore let a metrics call
+ * break job dispatch, so the sampler gets its own.
+ */
+export async function createInspectionChannel(): Promise<amqp.Channel | null> {
+  if (!connection) return null;
+  return connection.createChannel();
+}
+
+/** Closes the broker connection. Used by graceful shutdown. */
+export async function closeQueue() {
+  const conn = connection;
+  // Flagged and cleared first so the close handler does not treat this as an
+  // outage and start reconnecting into a process that is on its way out.
+  shuttingDown = true;
+  connection = null;
+  channel = null;
+
+  if (conn) {
+    try {
+      await conn.close();
+    } catch {
+      // Already gone. Nothing to do on the way out.
+    }
+  }
+}

@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { pruneJobEvents } from "./sse/bus";
+import { pruneWorkers, WORKER_FORGET_AFTER_HOURS } from "./observability/fleet";
 
 /**
  * Storage retention.
@@ -77,7 +78,7 @@ export async function sweepExpiredArtifacts(): Promise<number> {
   return removed;
 }
 
-/** Artifacts plus the SSE event log. */
+/** Artifacts, the SSE event log, and records of workers that are gone. */
 async function sweep() {
   await sweepExpiredArtifacts();
 
@@ -86,6 +87,13 @@ async function sweep() {
     if (pruned > 0) {
       console.log(`[Retention] Pruned ${pruned} job event(s) older than ${EVENT_LOG_RETENTION_DAYS} days.`);
     }
+  }
+
+  // A worker that scaled down should stop being reported as offline eventually,
+  // or its gauge holds an alert open for a machine nobody expects to return.
+  const forgotten = await pruneWorkers(WORKER_FORGET_AFTER_HOURS);
+  if (forgotten > 0) {
+    console.log(`[Retention] Forgot ${forgotten} worker(s) silent for over ${WORKER_FORGET_AFTER_HOURS}h.`);
   }
 }
 

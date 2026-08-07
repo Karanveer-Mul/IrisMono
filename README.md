@@ -18,7 +18,7 @@ Multi-tenant: an **organization** owns a shared pool of credits, and people belo
 - **Node.js 20+**
 - **Docker** — provides PostgreSQL 15 and RabbitMQ 3
 
-Ports used: **3000** (API), **3001** (frontend), **5432** (Postgres), **5672** / **15672** (RabbitMQ and its management UI).
+Ports used: **3000** (API), **3001** (frontend), **5432** (Postgres), **5672** / **15672** (RabbitMQ and its management UI), **9101** (worker probes and metrics).
 
 ---
 
@@ -90,6 +90,7 @@ A few decisions worth knowing before reading the code:
 - **Tenant isolation is enforced by Row-Level Security**, not only by query predicates. The app connects as a non-superuser role and sets the org context per transaction — see "Database identities" below.
 - **A session is scoped to one organization.** The JWT carries a single active `organizationId`; switching calls `POST /api/auth/switch-organization`, which re-checks the membership.
 - **SSE survives multiple API instances.** Events append to `job_events`, then fan out over a RabbitMQ exchange. Clients resume with `Last-Event-ID`.
+- **Liveness and readiness are different questions.** Only readiness consults Postgres and RabbitMQ — see "Operations" below.
 
 ### Database identities
 
@@ -117,6 +118,7 @@ npm run test:credits     # ledger integrity, refund idempotency, reconciliation
 npm run test:lifecycle   # reaper, dead-lettering, tier routing, provenance
 npm run test:identity    # one account across organizations, role per membership
 npm run test:sse         # cross-instance delivery and Last-Event-ID replay
+npm run test:observability  # probes, metrics, fleet visibility, correlation ids
 ```
 
 `test:sse` needs a **second API instance**, because a single-process test cannot distinguish a working bus from the in-process hub it replaced:
@@ -146,9 +148,46 @@ cd frontend && npx tsc --noEmit
 | `MODEL_VERSION` | `irismono-seg-sim-0.1.0` | Stamped onto every completed job. In a real deployment this is the image tag or model digest, injected at deploy time. The API rejects a `SUCCESS` report without it. |
 | `WORKER_QUEUES` | `queue-standard-jobs` | Start a second worker with `queue-vip-jobs` to give enterprise tenants dedicated capacity. |
 | `JOB_PENDING_TIMEOUT_MINUTES` | `30` | After this, an undispatched reservation is expired and its credit returned. |
+| `METRICS_TOKEN` | empty | Bearer token for `/metrics` and `/health/workers`. Unset leaves them open; see Operations. |
+| `WORKER_HEALTH_PORT` | `9101` | Where a worker answers probes and scrapes. Give each worker on a shared host its own port; `0` disables the listener. |
+| `WORKER_STALE_AFTER_SECONDS` | `45` | When the API stops counting a worker as online. Set independently of the worker's own heartbeat interval, because the API cannot know how a given worker was configured. |
+| `SHUTDOWN_DRAIN_MS` | `0` | How long to keep serving after SIGTERM. Zero suits local development; see Operations for what a deployment needs. |
 | `STORAGE_RETENTION_DAYS` | `30` | Deletes stored images. Job metadata is kept indefinitely for billing and audit. On real S3, use a bucket lifecycle rule instead — see `src/retention.ts`. |
 
 Storage and the ML model are both mocked for local development. Images go to `./uploads`, and the worker sleeps instead of running a model. Point `AWS_S3_ENDPOINT` at MinIO or LocalStack for real presigned uploads.
+
+---
+
+## Operations
+
+| Endpoint | Port | What it answers |
+|---|---|---|
+| `GET /health` | 3000 | Liveness. Never touches a dependency — a failing liveness probe gets the container killed, and killing every instance because Postgres blinked removes the capacity that would have absorbed it. |
+| `GET /health/ready` | 3000 | Readiness. Probes `postgres_app`, `postgres_auth`, and `rabbitmq`; 503 if any is down, which withdraws the instance without restarting it. |
+| `GET /health/workers` | 3000 | The GPU fleet, as reported by heartbeats. Never fails the request — it describes something other than the process answering it. |
+| `GET /metrics` | 3000 | Prometheus scrape. |
+| `GET /health`, `/health/ready`, `/metrics` | 9101 | The worker's own probes. Readiness here means *attached to the broker and consuming*, which is the condition that otherwise fails silently. |
+
+```bash
+curl -s localhost:3000/health/ready | jq
+curl -s localhost:3000/health/workers | jq
+curl -s localhost:3000/metrics | grep '^job_'
+curl -s localhost:9101/health/ready | jq          # with the worker running
+```
+
+**What to alert on.** `queue_messages_ready` with `queue_consumers` at zero is a stopped fleet; the same depth with healthy consumers is real demand, and the two want opposite responses. `job_queue_wait_seconds` is the better autoscaling signal of the two because it is denominated in what the customer waits for. Any non-zero depth on a `.dlq` queue is work that was accepted, charged for, and abandoned. `db_pool_connections{state="waiting"}` above zero means the pool is the bottleneck, which presents as uniform latency across unrelated endpoints.
+
+**Correlation ids.** Every response carries `x-request-id`, and an inbound one is honoured. The id follows the job onto the queue and back through the worker's report, so one grep reconstructs a job across the API, the broker, and the GPU tier:
+
+```bash
+grep 5511cb2d api.log worker.log
+```
+
+Set `LOG_FORMAT=json` for shipper-readable output.
+
+**Securing the ops endpoints.** `/metrics` and `/health/workers` describe internal topology — how many instances run, which model versions are deployed, how much capacity is idle, how far behind the queue is. Set `METRICS_TOKEN` wherever the scrape crosses a network you do not control; the endpoints then require it as a bearer token, and readiness stops returning dependency error strings to unauthenticated callers. Left unset they are open and the API warns at startup.
+
+**Shutdown.** SIGTERM fails readiness first, waits `SHUTDOWN_DRAIN_MS`, then closes the listener and releases the broker and pools. In an orchestrator set the drain above the load balancer's health-check interval — the pod is removed from the endpoint list and signalled at the same moment, and traffic keeps arriving until the balancer notices. Note that Windows has no real SIGTERM: Node terminates unconditionally there and the handler does not run.
 
 ---
 

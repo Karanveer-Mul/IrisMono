@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import { systemDb } from "./db";
 import { publishJobEvent } from "./sse/bus";
 import { refundCredit } from "./credits";
+import { jobsReaped } from "./observability/apiMetrics";
 
 /**
  * Reclaims credits from jobs that will never finish.
@@ -65,6 +66,11 @@ async function expire(
         refunded.push(row);
       }
     }
+
+    // Labelled by the state the job was reaped out of, because the two mean
+    // different things: expired PENDING is abandoned uploads, expired
+    // PROCESSING is workers dying mid-job.
+    jobsReaped.inc({ from_status: status }, refunded.length);
 
     return refunded;
   });

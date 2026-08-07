@@ -114,6 +114,24 @@ export const jobEvents = pgTable("job_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// 7. Worker heartbeats
+//
+// Fleet liveness, not tenant data. The GPU tier holds no database credentials,
+// so workers post heartbeats to the API and the API records them here - which
+// makes the fleet visible from every API instance, not just the one that
+// received the last beat. See migration 0008.
+export const workerHeartbeats = pgTable("worker_heartbeats", {
+  workerId: varchar("worker_id", { length: 100 }).primaryKey(),
+  modelVersion: varchar("model_version", { length: 100 }),
+  queues: varchar("queues", { length: 255 }).notNull(),
+  status: varchar("status", { length: 16 }).notNull(),
+  currentJobId: uuid("current_job_id"),
+  jobsProcessed: integer("jobs_processed").notNull().default(0),
+  jobsFailed: integer("jobs_failed").notNull().default(0),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // Relations for ORM query building convenience
 export const organizationsRelations = relations(organizations, ({ many }) => ({
   memberships: many(memberships),
