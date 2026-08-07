@@ -4,8 +4,19 @@ import { organizations, organizationInvites } from "../db/schema";
 import { eq, and } from "drizzle-orm";
 import { authenticateJWT, AuthenticatedRequest, requireRole } from "../middleware/auth";
 import { randomUUID } from "crypto";
+import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
 
 const router = ExpressRouter();
+
+/**
+ * Defaults applied when an admin does not specify them.
+ *
+ * Both exist because the safe value has to be the one you get by not thinking
+ * about it. A link that never expires and never runs out is the shape of every
+ * invite-link incident.
+ */
+const DEFAULT_INVITE_MAX_USES = Number(process.env.DEFAULT_INVITE_MAX_USES || 25);
+const DEFAULT_INVITE_DAYS = Number(process.env.DEFAULT_INVITE_DAYS || 30);
 
 // Apply auth protection & admin role requirement for all invite management routes
 router.use(authenticateJWT);
@@ -18,11 +29,24 @@ router.use(requireRole("ORG_ADMIN"));
 router.post("/", async (req: AuthenticatedRequest, res: Response) => {
   const orgId = req.user!.organizationId;
   const userId = req.user!.id;
-  const { allowedDomains, expiresDays } = req.body;
+  const { allowedDomains, expiresDays, maxUses } = req.body;
+
+  // A cap is the difference between an invitation and a standing offer: without
+  // one, anybody who ever sees the link - forwarded, screenshotted, pasted into
+  // a ticket - can admit themselves for as long as it exists. Defaulted rather
+  // than required, so creating a link does not silently create an uncapped one.
+  const cap =
+    maxUses === null || maxUses === "unlimited"
+      ? null
+      : Number.isFinite(Number(maxUses)) && Number(maxUses) > 0
+        ? Math.trunc(Number(maxUses))
+        : DEFAULT_INVITE_MAX_USES;
 
   try {
     const inviteCode = `inv_${randomUUID()}`;
-    const expiresAt = expiresDays ? new Date(Date.now() + expiresDays * 24 * 60 * 60 * 1000) : null;
+    const expiresAt = expiresDays
+      ? new Date(Date.now() + expiresDays * 24 * 60 * 60 * 1000)
+      : new Date(Date.now() + DEFAULT_INVITE_DAYS * 24 * 60 * 60 * 1000);
 
     const newInvite = await withTenant(orgId, async (tx) => {
       // Use organization allowed domains as default if none specified
@@ -43,10 +67,26 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
           isActive: true,
           createdBy: userId,
           expiresAt,
+          maxUses: cap,
         })
         .returning();
 
       return created;
+    });
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.INVITE_CREATED,
+      organizationId: orgId,
+      actorUserId: userId,
+      actorEmail: req.user!.email,
+      target: newInvite.inviteCode,
+      metadata: {
+        inviteId: newInvite.id,
+        maxUses: cap,
+        expiresAt: expiresAt.toISOString(),
+        allowedDomains: newInvite.allowedDomains,
+      },
+      ip: clientIp(req),
     });
 
     return res.status(201).json({
@@ -95,6 +135,16 @@ router.patch("/:inviteId/toggle", async (req: AuthenticatedRequest, res: Respons
     if (!updatedInvite) {
       return res.status(404).json({ error: "Invite link not found" });
     }
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.INVITE_TOGGLED,
+      organizationId: orgId,
+      actorUserId: req.user!.id,
+      actorEmail: req.user!.email,
+      target: updatedInvite.inviteCode,
+      metadata: { isActive: updatedInvite.isActive, usesCount: updatedInvite.usesCount },
+      ip: clientIp(req),
+    });
 
     return res.status(200).json({
       message: `Invite link ${updatedInvite.isActive ? "activated" : "deactivated"} successfully.`,
@@ -169,6 +219,18 @@ router.post("/domains", async (req: AuthenticatedRequest, res: Response) => {
         error: "Action denied. Organization whitelist must contain at least one domain pattern."
       });
     }
+
+    // Widening the whitelist widens who can admit themselves through every
+    // existing link, so it is a security-relevant change and is recorded.
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.DOMAINS_CHANGED,
+      organizationId: orgId,
+      actorUserId: req.user!.id,
+      actorEmail: req.user!.email,
+      target: cleanDomain,
+      metadata: { action, allowedDomains: outcome.allowedDomains },
+      ip: clientIp(req),
+    });
 
     return res.status(200).json({
       message: "Allowed domains updated successfully",

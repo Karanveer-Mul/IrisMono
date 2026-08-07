@@ -125,6 +125,7 @@ npm run test:lifecycle   # reaper, dead-lettering, tier routing, provenance
 npm run test:identity    # one account across organizations, role per membership
 npm run test:sse         # cross-instance delivery and Last-Event-ID replay
 npm run test:observability  # probes, metrics, fleet visibility, correlation ids
+npm run test:security    # audit chain, invite caps, encryption at rest, lockout
 ```
 
 `test:sse` needs a **second API instance**, because a single-process test cannot distinguish a working bus from the in-process hub it replaced:
@@ -157,6 +158,9 @@ cd frontend && npx tsc --noEmit
 | `MAX_UPLOAD_BYTES` | `26214400` | Ceiling on a single scan, enforced while streaming. |
 | `JOB_RETRY_DELAYS_MS` | `10000,60000,300000` | Redelivery schedule for a job whose outcome could not be established. One holding queue is declared per entry, so changing this adds or removes queues rather than altering existing ones. Exhausting the list dead-letters the message. |
 | `JOB_PENDING_TIMEOUT_MINUTES` | `30` | After this, an undispatched reservation is expired and its credit returned. |
+| `MASTER_KEY_BASE64` | empty | Wraps each organization's data key; 32 bytes, base64. Unset means scans are stored in the clear — see Security. |
+| `MAX_FAILED_LOGINS` | `5` | Consecutive failures before a 15-minute lockout. |
+| `DEFAULT_INVITE_MAX_USES` | `25` | Applied when an admin creates a link without a cap. |
 | `METRICS_TOKEN` | empty | Bearer token for `/metrics` and `/health/workers`. Unset leaves them open; see Operations. |
 | `WORKER_HEALTH_PORT` | `9101` | Where a worker answers probes and scrapes. Give each worker on a shared host its own port; `0` disables the listener. |
 | `WORKER_STALE_AFTER_SECONDS` | `45` | When the API stops counting a worker as online. Set independently of the worker's own heartbeat interval, because the API cannot know how a given worker was configured. |
@@ -180,6 +184,23 @@ aws s3api put-bucket-notification-configuration \
 The endpoint requires `STORAGE_EVENT_SECRET` in an `x-storage-secret` header. Note that the size ceiling cannot be enforced on a presigned PUT — a presigned POST policy with `content-length-range` is what a production deployment needs there.
 
 Storage and the ML model are both mocked for local development. Images go to `./uploads`, and the worker sleeps instead of running a model. Point `AWS_S3_ENDPOINT` at MinIO or LocalStack for real presigned uploads.
+
+---
+
+## Security
+
+- **Scans are encrypted at rest, per tenant.** Each organization has its own AES-256-GCM data key, stored only wrapped by `MASTER_KEY_BASE64`. Destroying one tenant's key makes that tenant's scans unreadable without touching anyone else's — which is how "delete our data" is honoured across object storage and backups. Leave `MASTER_KEY_BASE64` unset and scans are stored in the clear; it is deliberately not defaulted, because a hardcoded fallback would encrypt everything with a key published in this repository.
+- **The audit log is append-only and tamper-evident.** `audit_events` is hash-chained. `UPDATE`/`DELETE` are revoked from the application roles, a trigger blocks them for the owner too, and `GET /api/audit/verify` recomputes the chain and names the first row that does not verify. Sign-ins, invite activity (including every refusal and its reason), whitelist changes, and **every read of a scan** are recorded.
+- **Invite links expire and run out.** Default 25 uses and 30 days when unspecified, enforced by a `CHECK` constraint as well as by the handler, and `memberships.invite_id` records which link admitted whom.
+- **Sign-ins are throttled.** Five failures lock an account for 15 minutes, counted in the database so the limit does not divide by the number of API instances. Passwords are length-first: 12 characters minimum.
+
+Generate a master key with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+**Not implemented**, and load-bearing for a real deployment: a KMS (the master key is an environment variable, so it shares a blast radius with the process that reads it), SSO/SAML, MFA, and DICOM de-identification. `AUDIT.md` §7 explains what each would take and why a half-version of it would be worse than its absence.
 
 ---
 

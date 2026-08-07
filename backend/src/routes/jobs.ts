@@ -10,6 +10,13 @@ import {
   AuthenticatedRequest,
 } from "../middleware/auth";
 import { dispatchJob } from "../dispatch";
+import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
+import {
+  decryptForOrganization,
+  encryptForOrganization,
+  encryptionConfigured,
+  isEncrypted,
+} from "../crypto";
 import { sseHub } from "../sse";
 import { publishJobEvent } from "../sse/bus";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -197,8 +204,12 @@ router.put("/mock-upload/:jobId", async (req, res) => {
     }
 
     const filePath = path.join(UPLOADS_DIR, `${jobId}-raw.png`);
-    const writeStream = fs.createWriteStream(filePath);
 
+    // Buffered rather than streamed straight to disk, because the bytes are
+    // encrypted before they land: an authenticated cipher produces its tag at
+    // the end, so nothing can be written until the whole body is in hand. The
+    // ceiling below is what makes that safe to hold in memory.
+    const chunks: Buffer[] = [];
     let received = 0;
     let rejection: string | null = null;
     let signatureChecked = false;
@@ -206,10 +217,6 @@ router.put("/mock-upload/:jobId", async (req, res) => {
     const abort = async (reason: string, statusCode: number) => {
       if (rejection) return;
       rejection = reason;
-
-      req.unpipe(writeStream);
-      writeStream.destroy();
-      await fs.promises.rm(filePath, { force: true }).catch(() => {});
 
       // The reservation is settled here rather than left to the reaper. The
       // upload was answered - nothing further is coming for this job - so
@@ -227,7 +234,7 @@ router.put("/mock-upload/:jobId", async (req, res) => {
 
       // A presigned PUT sets only ContentType: the client picks the body, so
       // the ceiling has to be enforced where the bytes land. Checked as they
-      // stream, not from Content-Length, which the client also picks.
+      // arrive, not from Content-Length, which the client also picks.
       received += chunk.length;
       if (received > MAX_UPLOAD_BYTES) {
         void abort(`Upload exceeds the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB limit`, 413);
@@ -240,46 +247,60 @@ router.put("/mock-upload/:jobId", async (req, res) => {
         signatureChecked = true;
         if (!chunk.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
           void abort("Upload is not a PNG image", 415);
+          return;
         }
       }
+
+      chunks.push(chunk);
     });
 
-    writeStream.on("finish", async () => {
+    req.on("end", async () => {
       if (rejection) return;
 
       if (received === 0) {
         return abort("Upload is empty", 400);
       }
 
-      console.log(`Mock S3 direct-upload completed locally for job ${jobId} (${received} bytes)`);
-
-      // Upload completion *is* the trigger. On real S3 this is the bucket's
-      // event notification calling POST /api/jobs/storage-events; here the
-      // mock storage layer is in-process, so it calls dispatch directly.
       try {
+        const job = await systemDb.query.jobs.findFirst({
+          where: eq(jobs.id, jobId),
+          columns: { organizationId: true },
+        });
+
+        if (!job) {
+          return res.status(404).json({ error: "No reservation exists for this upload" });
+        }
+
+        // Encrypted with the tenant's own data key before it touches the disk,
+        // so the image directory is inert without the key that wraps it.
+        const plaintext = Buffer.concat(chunks);
+        const atRest = encryptionConfigured()
+          ? await encryptForOrganization(job.organizationId, plaintext)
+          : plaintext;
+
+        await fs.promises.writeFile(filePath, atRest);
+
+        console.log(
+          `Mock S3 direct-upload completed locally for job ${jobId} ` +
+          `(${received} bytes, ${encryptionConfigured() ? "encrypted" : "plaintext"})`
+        );
+
+        // Upload completion *is* the trigger. On real S3 this is the bucket's
+        // event notification calling POST /api/jobs/storage-events; here the
+        // mock storage layer is in-process, so it calls dispatch directly.
         const result = await dispatchJob(jobId, { requestId: req.requestId });
         return res.status(200).json({
           message: "Upload completed successfully",
           dispatched: result.dispatched,
           ...(result.dispatched ? { queue: result.queue } : {}),
         });
-      } catch (dispatchError) {
-        // The image is stored; only the queueing failed. Answering 500 lets the
-        // client retry the upload, which will dispatch it then.
-        console.error(`Upload stored but dispatch failed for job ${jobId}:`, dispatchError);
-        return res.status(500).json({ error: "Upload stored but could not be queued" });
+      } catch (error) {
+        console.error(`Upload handling failed for job ${jobId}:`, error);
+        if (!res.headersSent) {
+          return res.status(500).json({ error: "Upload could not be stored or queued" });
+        }
       }
     });
-
-    writeStream.on("error", (err) => {
-      if (rejection) return;
-      console.error("Mock upload write error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Mock upload failed writing file" });
-      }
-    });
-
-    req.pipe(writeStream);
 
   } catch (error) {
     console.error("Mock upload catch error:", error);
@@ -778,9 +799,29 @@ router.get("/:jobId/image/:kind", async (req: AuthenticatedRequest, res: Respons
       return res.status(404).json({ error: `No ${kind} image stored for this job` });
     }
 
+    const stored = await fs.promises.readFile(filePath);
+    // Decrypted on the way out. A file written before encryption was enabled
+    // passes through unchanged, so switching it on does not orphan old scans.
+    const image = await decryptForOrganization(orgId, stored);
+
+    // Every read of a scan is recorded. This is the question a hospital asks
+    // after an incident - who opened this patient's images, and when - and it
+    // cannot be answered retrospectively if it was not being written down.
+    void recordAuditEvent({
+      action: AUDIT_ACTIONS.SCAN_ACCESSED,
+      organizationId: orgId,
+      actorUserId: req.user!.id,
+      actorEmail: req.user!.email,
+      target: jobId,
+      metadata: { kind, encrypted: isEncrypted(stored) },
+      ip: clientIp(req),
+    });
+
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Cache-Control", "private, max-age=300");
-    return fs.createReadStream(filePath).pipe(res);
+    // no-store, not a private cache window: a scan left in a shared
+    // workstation's browser cache outlives the session that fetched it.
+    res.setHeader("Cache-Control", "no-store");
+    return res.send(image);
 
   } catch (error) {
     console.error("Failed to serve job image:", error);

@@ -35,6 +35,11 @@ export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   email: varchar("email", { length: 255 }).unique().notNull(),
   passwordHash: varchar("password_hash", { length: 255 }).notNull(),
+  // Sign-in throttling. Held here rather than in process memory because the API
+  // runs behind a load balancer - see src/passwords.ts.
+  failedLoginCount: integer("failed_login_count").notNull().default(0),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
+  lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -48,6 +53,9 @@ export const memberships = pgTable("memberships", {
   userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
   role: userRoleEnum("role").notNull().default("MEMBER"),
+  // Which invite link admitted this person, when one did. Null for the founder
+  // of a workspace and for memberships created before migration 0010.
+  inviteId: uuid("invite_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -58,6 +66,11 @@ export const organizationInvites = pgTable("organization_invites", {
   inviteCode: varchar("invite_code", { length: 100 }).unique().notNull(),
   allowedDomains: text("allowed_domains").array().notNull().default(sql`'{}'::text[]`),
   isActive: boolean("is_active").notNull().default(true),
+  // Null means unlimited, which is the old behaviour and should be the
+  // exception: an uncapped reusable link is a standing offer to anyone who
+  // ever sees it. Enforced by a CHECK as well as by the handler.
+  maxUses: integer("max_uses"),
+  usesCount: integer("uses_count").notNull().default(0),
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   expiresAt: timestamp("expires_at", { withTimezone: true }),
@@ -133,6 +146,25 @@ export const workerHeartbeats = pgTable("worker_heartbeats", {
   jobsFailed: integer("jobs_failed").notNull().default(0),
   startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
   lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// 8. Audit log
+//
+// Append-only and hash-chained. Immutability is enforced in the database
+// (revoked grants plus a blocking trigger) and made verifiable by the chain -
+// see migration 0010 and src/audit.ts. Never written through the ORM.
+export const auditEvents = pgTable("audit_events", {
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  organizationId: uuid("organization_id"),
+  actorUserId: uuid("actor_user_id"),
+  actorEmail: varchar("actor_email", { length: 255 }),
+  action: varchar("action", { length: 64 }).notNull(),
+  target: varchar("target", { length: 255 }),
+  metadata: jsonb("metadata").notNull(),
+  ip: varchar("ip", { length: 64 }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  previousHash: varchar("previous_hash", { length: 64 }),
+  hash: varchar("hash", { length: 64 }).notNull(),
 });
 
 // Relations for ORM query building convenience

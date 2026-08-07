@@ -4,12 +4,14 @@ import { Router, Request, Response } from "express";
 // RLS-bypassing system identity. Everything with a known tenant uses withTenant.
 import { systemDb, withTenant } from "../db";
 import { organizations, users, memberships, organizationInvites } from "../db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
 import { isEmailDomainAllowed, getEmailDomain } from "../utils/domain";
 import { authenticateJWT, AuthenticatedRequest, issueStreamToken } from "../middleware/auth";
 import { grantCredits } from "../credits";
+import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
+import { checkPasswordStrength, clearFailedLogins, registerFailedLogin } from "../passwords";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-change-in-production";
@@ -90,6 +92,14 @@ router.post("/register", async (req: Request, res: Response) => {
           error: "Email is already registered. Sign in to create an additional workspace.",
         });
       }
+    } else {
+      // Only checked when a password is actually being set. An existing account
+      // adding a workspace is authenticating with a password it already has,
+      // and rejecting it here would lock them out of their own account.
+      const strength = checkPasswordStrength(password, email);
+      if (!strength.ok) {
+        return res.status(400).json({ error: strength.error });
+      }
     }
 
     const result = await systemDb.transaction(async (tx) => {
@@ -117,7 +127,21 @@ router.post("/register", async (req: Request, res: Response) => {
         role: "ORG_ADMIN",
       });
 
-      return { token: issueSessionToken(user!, newOrg.id, "ORG_ADMIN"), userId: user!.id };
+      return {
+        token: issueSessionToken(user!, newOrg.id, "ORG_ADMIN"),
+        userId: user!.id,
+        organizationId: newOrg.id,
+      };
+    });
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.REGISTERED,
+      organizationId: result.organizationId,
+      actorUserId: result.userId,
+      actorEmail: email,
+      target: orgName,
+      metadata: { existingAccount: !!existingUser, allowedDomain: creatorDomain },
+      ip: clientIp(req),
     });
 
     return res.status(201).json({
@@ -156,12 +180,31 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Invite link not found" });
     }
 
+    /** Every refusal is recorded against the link, so probing is visible. */
+    const rejectInvite = async (reason: string) => {
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.INVITE_REJECTED,
+        organizationId: invite.organizationId,
+        actorEmail: email,
+        target: invite.inviteCode,
+        metadata: { reason },
+        ip: clientIp(req),
+      });
+    };
+
     if (!invite.isActive) {
+      await rejectInvite("revoked");
       return res.status(410).json({ error: "This invite link has been revoked or deactivated" });
     }
 
     if (invite.expiresAt && new Date() > invite.expiresAt) {
+      await rejectInvite("expired");
       return res.status(410).json({ error: "This invite link has expired" });
+    }
+
+    if (invite.maxUses !== null && invite.usesCount >= invite.maxUses) {
+      await rejectInvite("exhausted");
+      return res.status(410).json({ error: "This invite link has reached its usage limit" });
     }
 
     // Hospital-grade domain whitelist enforcement. Invite whitelist first, then
@@ -175,6 +218,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
     }
 
     if (!isEmailDomainAllowed(email, allowedDomains)) {
+      await rejectInvite("domain_not_allowed");
       return res.status(403).json({
         error: `Registration denied. Your email domain is not authorized for this organization. Whitelist includes: ${allowedDomains.join(", ")}`,
       });
@@ -187,6 +231,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
     if (existingUser) {
       const isMatch = await bcrypt.compare(password, existingUser.passwordHash);
       if (!isMatch) {
+        await rejectInvite("wrong_password_for_existing_account");
         return res.status(401).json({
           error: "This email already has an account. Use its password to join this organization.",
         });
@@ -202,9 +247,31 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
       if (already) {
         return res.status(409).json({ error: "You are already a member of this organization" });
       }
+    } else {
+      const strength = checkPasswordStrength(password, email);
+      if (!strength.ok) {
+        return res.status(400).json({ error: strength.error });
+      }
     }
 
     const result = await systemDb.transaction(async (tx) => {
+      // Consume the use inside the transaction, conditionally on the cap. The
+      // CHECK constraint would catch an overrun anyway, but claiming it here
+      // means two people redeeming the last use at once are serialised on this
+      // row rather than one of them hitting a constraint violation.
+      const consumed = await tx.execute(sql`
+        UPDATE organization_invites
+           SET uses_count = uses_count + 1
+         WHERE id = ${invite.id}
+           AND is_active = true
+           AND (max_uses IS NULL OR uses_count < max_uses)
+        RETURNING uses_count, max_uses
+      `);
+
+      if (consumed.rows.length === 0) {
+        return { exhausted: true as const };
+      }
+
       let user = existingUser;
       if (!user) {
         const salt = await bcrypt.genSalt(10);
@@ -216,9 +283,38 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
         userId: user!.id,
         organizationId: invite.organizationId,
         role: "MEMBER",
+        // Which link admitted this person. Revoking a leaked invite can now
+        // answer "and who did it let in?", which it previously could not.
+        inviteId: invite.id,
       });
 
-      return { token: issueSessionToken(user!, invite.organizationId, "MEMBER"), userId: user!.id };
+      const row = consumed.rows[0] as any;
+      return {
+        token: issueSessionToken(user!, invite.organizationId, "MEMBER"),
+        userId: user!.id,
+        usesCount: Number(row.uses_count),
+        maxUses: row.max_uses === null ? null : Number(row.max_uses),
+      };
+    });
+
+    if ("exhausted" in result) {
+      await rejectInvite("exhausted");
+      return res.status(410).json({ error: "This invite link has reached its usage limit" });
+    }
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.INVITE_REDEEMED,
+      organizationId: invite.organizationId,
+      actorUserId: result.userId,
+      actorEmail: email,
+      target: invite.inviteCode,
+      metadata: {
+        inviteId: invite.id,
+        existingAccount: !!existingUser,
+        usesCount: result.usesCount,
+        maxUses: result.maxUses,
+      },
+      ip: clientIp(req),
     });
 
     return res.status(201).json({
@@ -251,13 +347,56 @@ router.post("/login", async (req: Request, res: Response) => {
     });
 
     if (!user) {
+      // Recorded even though no account exists: a spray across many addresses
+      // is exactly the pattern that leaves no trace if only known accounts are
+      // logged. The response is unchanged, so nothing is disclosed.
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.LOGIN_FAILED,
+        actorEmail: email,
+        target: email,
+        metadata: { reason: "unknown_account" },
+        ip: clientIp(req),
+      });
       return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.LOGIN_BLOCKED,
+        actorUserId: user.id,
+        actorEmail: user.email,
+        target: user.email,
+        metadata: { lockedUntil: user.lockedUntil.toISOString() },
+        ip: clientIp(req),
+      });
+      // 423 rather than 401, and the caller is told when it lifts: hiding the
+      // lockout would just look like a wrong password and invite more attempts
+      // from the legitimate owner.
+      return res.status(423).json({
+        error: "Too many failed sign-in attempts. This account is temporarily locked.",
+        lockedUntil: user.lockedUntil.toISOString(),
+      });
     }
 
     const isMatch = await bcrypt.compare(password, user.passwordHash);
     if (!isMatch) {
+      const outcome = await registerFailedLogin(user.id);
+
+      await recordAuditEvent({
+        action: outcome.locked ? AUDIT_ACTIONS.ACCOUNT_LOCKED : AUDIT_ACTIONS.LOGIN_FAILED,
+        actorUserId: user.id,
+        actorEmail: user.email,
+        target: user.email,
+        metadata: { reason: "bad_password", consecutiveFailures: outcome.failures },
+        ip: clientIp(req),
+      });
+
       return res.status(401).json({ error: "Invalid email or password" });
     }
+
+    // A successful sign-in clears the counter: the lockout is meant to stop a
+    // run of guesses, not to accumulate over months of ordinary typos.
+    await clearFailedLogins(user.id);
 
     const list = await membershipsOf(user.id);
 
@@ -268,6 +407,16 @@ router.post("/login", async (req: Request, res: Response) => {
     }
 
     const active = list[0];
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.LOGIN_SUCCEEDED,
+      organizationId: active.organizationId,
+      actorUserId: user.id,
+      actorEmail: user.email,
+      target: user.email,
+      metadata: { organizations: list.length },
+      ip: clientIp(req),
+    });
 
     return res.status(200).json({
       token: issueSessionToken(user, active.organizationId, active.role),
@@ -356,6 +505,16 @@ router.post("/switch-organization", authenticateJWT, async (req: AuthenticatedRe
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.ORGANIZATION_SWITCHED,
+      organizationId,
+      actorUserId: userId,
+      actorEmail: user.email,
+      target: organizationId,
+      metadata: { from: req.user!.organizationId, role: membership.role },
+      ip: clientIp(req),
+    });
 
     return res.status(200).json({
       token: issueSessionToken(user, organizationId, membership.role),

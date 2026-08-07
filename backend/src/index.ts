@@ -5,6 +5,7 @@ import jobsRouter from "./routes/jobs";
 import invitesRouter from "./routes/invites";
 import creditsRouter from "./routes/credits";
 import workersRouter from "./routes/workers";
+import auditRouter from "./routes/audit";
 import opsRouter, { beginDraining, warnIfMetricsUnprotected } from "./routes/ops";
 import { closeQueue, initQueue } from "./queue";
 import { initSseBus } from "./sse/bus";
@@ -52,6 +53,7 @@ app.use("/api/jobs", jobsRouter);
 app.use("/api/invites", invitesRouter);
 app.use("/api/credits", creditsRouter);
 app.use("/api/workers", workersRouter);
+app.use("/api/audit", auditRouter);
 
 // Initialize services and start server
 async function startServer() {
