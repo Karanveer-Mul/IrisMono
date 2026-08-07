@@ -20,6 +20,8 @@ interface AuditLog {
   rawImageS3Key: string;
   maskImageS3Key: string | null;
   errorMessage: string | null;
+  modelVersion: string | null;
+  gpuSeconds: number | null;
   createdAt: string;
   completedAt: string | null;
 }
@@ -222,6 +224,7 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                       <th>Job ID</th>
                       <th>Time Started</th>
                       <th>Status</th>
+                      <th>Model</th>
                       <th>Output Mask S3 Path</th>
                     </tr>
                   </thead>
@@ -248,6 +251,13 @@ export function Dashboard({ user, onLogout }: DashboardProps) {
                           }`} style={{ padding: "0.2rem 0.5rem", fontSize: "0.7rem" }}>
                             {log.status}
                           </span>
+                        </td>
+                        <td
+                          className="model-version-cell"
+                          style={{ fontFamily: "monospace", fontSize: "0.72rem", color: "var(--text-secondary)", whiteSpace: "nowrap" }}
+                          title={log.gpuSeconds != null ? `${log.gpuSeconds.toFixed(2)}s GPU time` : undefined}
+                        >
+                          {log.modelVersion ?? <span style={{ color: "var(--text-muted)" }}>—</span>}
                         </td>
                         <td
                           className="mask-path-cell"

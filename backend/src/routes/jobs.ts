@@ -94,10 +94,17 @@ router.get("/events", authenticateStreamToken, (req: AuthenticatedRequest, res: 
  */
 router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Response) => {
   const { jobId } = req.params;
-  const { status, maskImageS3Key, errorMessage } = req.body ?? {};
+  const { status, maskImageS3Key, errorMessage, modelVersion, workerId, gpuSeconds } = req.body ?? {};
 
   if (status !== "PROCESSING" && status !== "SUCCESS" && status !== "FAILED") {
     return res.status(400).json({ error: "status must be PROCESSING, SUCCESS or FAILED" });
+  }
+
+  // A produced mask must be attributable. Without this the guarantee is only a
+  // convention, and one worker deployed without MODEL_VERSION would silently
+  // create masks that cannot be traced to the model that generated them.
+  if (status === "SUCCESS" && (typeof modelVersion !== "string" || modelVersion.trim() === "")) {
+    return res.status(400).json({ error: "modelVersion is required when reporting SUCCESS" });
   }
 
   // The worker knows a job id and nothing else - it has no organization
@@ -109,8 +116,13 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
       const [updated] = await systemDb
         .update(jobs)
         // startedAt gives the reaper a clock for execution time, separate from
-        // how long the reservation has existed.
-        .set({ status: "PROCESSING", startedAt: new Date() })
+        // how long the reservation has existed. workerId is recorded at claim
+        // time so a job that never completes can still be traced to a machine.
+        .set({
+          status: "PROCESSING",
+          startedAt: new Date(),
+          workerId: typeof workerId === "string" ? workerId : null,
+        })
         .where(and(eq(jobs.id, jobId), eq(jobs.status, "PENDING")))
         .returning();
 
@@ -150,6 +162,9 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
           .set({
             status: "SUCCESS",
             maskImageS3Key: maskImageS3Key ?? null,
+            modelVersion: modelVersion.trim(),
+            workerId: typeof workerId === "string" ? workerId : null,
+            gpuSeconds: typeof gpuSeconds === "number" ? gpuSeconds : null,
             completedAt: new Date(),
           })
           .where(eq(jobs.id, jobId));
@@ -159,6 +174,11 @@ router.post("/:jobId/report", authenticateWorker, async (req: Request, res: Resp
           .set({
             status: "FAILED",
             errorMessage: errorMessage || "Model processing failed",
+            // Recorded on failure too: a model version that fails often is
+            // exactly what you want to be able to query for.
+            modelVersion: typeof modelVersion === "string" ? modelVersion.trim() : null,
+            workerId: typeof workerId === "string" ? workerId : null,
+            gpuSeconds: typeof gpuSeconds === "number" ? gpuSeconds : null,
             completedAt: new Date(),
           })
           .where(eq(jobs.id, jobId));
@@ -273,10 +293,17 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
 router.get("/logs", async (req: AuthenticatedRequest, res: Response) => {
   const orgId = req.user!.organizationId;
 
+  // Recall filter: ?modelVersion=<version> answers "which of our scans were
+  // produced by this model build?" - the question that matters when a version
+  // is withdrawn. Backed by idx_jobs_model_version.
+  const modelVersion = typeof req.query.modelVersion === "string" ? req.query.modelVersion : null;
+
   try {
     const logs = await withTenant(orgId, (tx) =>
       tx.query.jobs.findMany({
-        where: eq(jobs.organizationId, orgId),
+        where: modelVersion
+          ? and(eq(jobs.organizationId, orgId), eq(jobs.modelVersion, modelVersion))
+          : eq(jobs.organizationId, orgId),
         orderBy: (jobs, { desc }) => [desc(jobs.createdAt)],
       })
     );

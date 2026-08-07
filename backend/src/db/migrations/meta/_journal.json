@@ -36,6 +36,13 @@
       "when": 1786000300000,
       "tag": "0004_credit_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786000400000,
+      "tag": "0005_job_provenance",
+      "breakpoints": true
     }
   ]
 }

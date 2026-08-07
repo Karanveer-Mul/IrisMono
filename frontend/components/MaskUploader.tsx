@@ -11,6 +11,8 @@ interface JobInfo {
   rawImageS3Key: string;
   maskImageS3Key?: string | null;
   errorMessage?: string | null;
+  modelVersion?: string | null;
+  gpuSeconds?: number | null;
 }
 
 interface MaskUploaderProps {
@@ -207,6 +209,12 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
             <CheckCircle size={18} style={{ color: "#10b981" }} />
             <div style={{ fontSize: "0.85rem" }}>
               <strong>Mask Generated:</strong> Processing completed. 1 credit consumed.
+              {activeJob.modelVersion && (
+                <div style={{ marginTop: "0.35rem", color: "var(--text-secondary)", fontSize: "0.78rem" }}>
+                  Produced by <code style={{ fontFamily: "monospace" }}>{activeJob.modelVersion}</code>
+                  {activeJob.gpuSeconds != null && ` in ${activeJob.gpuSeconds.toFixed(2)}s of GPU time`}
+                </div>
+              )}
             </div>
           </div>
 

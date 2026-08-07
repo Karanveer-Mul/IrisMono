@@ -18,6 +18,7 @@ import { QUEUES, deadLetterQueueFor } from "./queue";
 
 const API = "http://localhost:3000/api";
 const AMQP_URL = process.env.AMQP_URL || "amqp://guest:guest@localhost:5672";
+const WORKER_SECRET = process.env.WORKER_SECRET || "local-dev-worker-secret";
 
 function assert(condition: boolean, message: string) {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -158,6 +159,53 @@ async function run() {
   console.log(`   -> ${QUEUES.VIP}: ${vipBefore} -> ${vipAfter}`);
   assert(vipAfter === vipBefore + 1, "message did not land on the VIP queue");
   console.log("   (this worker consumes the standard queue only, so it waits for VIP capacity)");
+
+  // ---------------------------------------------------------------
+  console.log("\n6. A SUCCESS without provenance is refused");
+  const orphan = await reserveJob(org.token);
+  await fetch(`${API}/jobs/${orphan}/report`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SECRET },
+    body: JSON.stringify({ status: "PROCESSING", workerId: "test-harness" }),
+  });
+  const noProvenance = await fetch(`${API}/jobs/${orphan}/report`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SECRET },
+    body: JSON.stringify({ status: "SUCCESS", maskImageS3Key: "somewhere/mask.png" }),
+  });
+  console.log(`   -> HTTP ${noProvenance.status}`);
+  assert(noProvenance.status === 400, "a mask was accepted with no model version");
+
+  console.log("\n7. Provenance is recorded and the recall query finds it");
+  const version = `test-model-${stamp}`;
+  const withProvenance = await fetch(`${API}/jobs/${orphan}/report`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-worker-secret": WORKER_SECRET },
+    body: JSON.stringify({
+      status: "SUCCESS",
+      maskImageS3Key: "somewhere/mask.png",
+      modelVersion: version,
+      workerId: "test-harness",
+      gpuSeconds: 4.25,
+    }),
+  });
+  assert(withProvenance.status === 200, "provenance-carrying report was refused");
+
+  const stored = await systemDb.execute(
+    sql`SELECT model_version, worker_id, gpu_seconds FROM jobs WHERE id = ${orphan}`
+  );
+  const row = stored.rows[0] as any;
+  console.log(`   -> model ${row.model_version}, worker ${row.worker_id}, ${row.gpu_seconds}s`);
+  assert(row.model_version === version, "model version not stored");
+  assert(row.worker_id === "test-harness", "worker id not stored");
+  assert(Number(row.gpu_seconds) === 4.25, "gpu seconds not stored");
+
+  const recall = await fetch(`${API}/jobs/logs?modelVersion=${encodeURIComponent(version)}`, {
+    headers: { Authorization: `Bearer ${org.token}` },
+  });
+  const recalled = (await recall.json()).logs as any[];
+  console.log(`   -> recall query returned ${recalled.length} job(s)`);
+  assert(recalled.length === 1 && recalled[0].id === orphan, "recall query did not isolate the affected job");
 
   // Leave the broker as we found it.
   await ch.purgeQueue(QUEUES.VIP);

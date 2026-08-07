@@ -1,6 +1,7 @@
 import * as amqp from "amqplib";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { assertTopology, QUEUES } from "./queue";
 
@@ -20,6 +21,16 @@ const CONSUMED_QUEUES = (process.env.WORKER_QUEUES || QUEUES.STANDARD)
   .split(",")
   .map((q) => q.trim())
   .filter(Boolean);
+
+/**
+ * Which model build this worker runs, and which worker it is.
+ *
+ * MODEL_VERSION is stamped onto every job this process completes. In a real
+ * deployment it is the image tag or model artifact digest, injected at deploy
+ * time - never edited by hand, or the provenance record means nothing.
+ */
+const MODEL_VERSION = process.env.MODEL_VERSION || "irismono-seg-sim-0.1.0";
+const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}:${process.pid}`;
 
 /** In-process retries before a message is dead-lettered. */
 const REPORT_ATTEMPTS = Number(process.env.WORKER_REPORT_ATTEMPTS || 3);
@@ -50,6 +61,9 @@ async function reportJobStatus(
     status: "PROCESSING" | "SUCCESS" | "FAILED";
     maskImageS3Key?: string;
     errorMessage?: string;
+    modelVersion?: string;
+    workerId?: string;
+    gpuSeconds?: number;
   }
 ) {
   let response: globalThis.Response;
@@ -120,6 +134,7 @@ async function startWorker() {
     // Prefetch 1 message to simulate concurrency control per worker
     channel.prefetch(1);
 
+    console.log(`Worker ${WORKER_ID} running ${MODEL_VERSION}`);
     console.log(`Worker listening on: ${CONSUMED_QUEUES.join(", ")}`);
 
     for (const queue of CONSUMED_QUEUES) {
@@ -151,7 +166,7 @@ async function handleMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage | n
     // 1. Claim the job. A 409 means it is no longer PENDING - another delivery
     // already owns it, so drop this copy rather than racing.
     try {
-      await reportWithRetry(jobId, { status: "PROCESSING" });
+      await reportWithRetry(jobId, { status: "PROCESSING", workerId: WORKER_ID });
     } catch (claimErr) {
       if (claimErr instanceof ReportError && claimErr.httpStatus === 409) {
         console.warn(`[Worker] Job ${jobId} is not PENDING; discarding duplicate delivery.`);
@@ -162,8 +177,10 @@ async function handleMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage | n
     }
 
     // 2. Simulate heavy GPU processing (e.g. 5 seconds)
-    console.log(`[Worker] Running machine learning mask model on GPU for job ${jobId}...`);
+    console.log(`[Worker] Running ${MODEL_VERSION} on GPU for job ${jobId}...`);
+    const gpuStart = Date.now();
     await sleep(5000);
+    const gpuSeconds = (Date.now() - gpuStart) / 1000;
 
     // 3. Simulated model outcomes (90% success, 10% failure simulation)
     const isSuccess = Math.random() > 0.1;
@@ -186,9 +203,12 @@ async function handleMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage | n
     await reportWithRetry(jobId, {
       status: "SUCCESS",
       maskImageS3Key: `org_id=${orgId}/jobs/${jobId}/mask.png`,
+      modelVersion: MODEL_VERSION,
+      workerId: WORKER_ID,
+      gpuSeconds,
     });
 
-    console.log(`[Worker] Job ${jobId} completed successfully.`);
+    console.log(`[Worker] Job ${jobId} completed successfully in ${gpuSeconds}s using ${MODEL_VERSION}.`);
     channel.ack(msg);
 
   } catch (error: any) {
@@ -202,6 +222,8 @@ async function handleMessage(channel: amqp.Channel, msg: amqp.ConsumeMessage | n
         await reportWithRetry(jobId, {
           status: "FAILED",
           errorMessage: error.message,
+          modelVersion: MODEL_VERSION,
+          workerId: WORKER_ID,
         });
         console.log(`[Worker] Job ${jobId} reported as FAILED. Credit refunded by API.`);
         channel.ack(msg);

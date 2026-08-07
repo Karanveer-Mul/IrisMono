@@ -112,7 +112,7 @@ For a product whose entire market is hospitals, this is the largest gap in the d
 
 Also missing at the design level: dead-letter queue, retry policy with backoff, and an idempotency key on the job message so that redelivery cannot double-process or double-refund.
 
-### 2.9 The jobs table cannot support the business
+### 2.9 The jobs table cannot support the business *(resolved — see §7)*
 
 No `model_version`, no `gpu_seconds`, no `worker_id`, no processing duration.
 
@@ -399,7 +399,19 @@ All movement funnels through `src/credits.ts` (`reserveCredit`, `refundCredit`, 
 
 `npm run test:credits` asserts the whole invariant: the trial grant is recorded rather than defaulted, a reservation links to its job, a failure refunds exactly once, a replayed refund returns false and writes nothing, a refused overdraft leaves no ledger row, entries sum to the stored balance, the endpoint agrees with the database, history does not leak across tenants, and every organization in the database reconciles.
 
-**Status update.** All eight defect fixes have been applied, plus the credit ledger from the design critique. Five suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
+### Job provenance (design item §2.9)
+
+Migration `0005` adds `model_version`, `worker_id`, and `gpu_seconds` to `jobs`, with a partial index on `model_version`.
+
+`model_version` is the one that had to happen before the next real customer: if a model build is later found defective, you must be able to identify every mask it produced. Retrofitting it leaves all existing masks unattributable. It is enforced rather than hoped for — **the API rejects a `SUCCESS` report that carries no model version with a 400**, so a worker deployed without `MODEL_VERSION` fails loudly instead of quietly generating untraceable masks. Failures record it too, since a version that fails often is exactly what you want to query for.
+
+The recall path is `GET /api/jobs/logs?modelVersion=<version>`, backed by `idx_jobs_model_version`; operators can answer the same question across tenants directly against the index. The version and GPU time are surfaced in the job history table and the success panel, because a provenance record nobody can see is not much of a record.
+
+`gpu_seconds` is recorded even though billing is flat at 1 credit per image. A chest X-ray and a full CT volume differ by orders of magnitude in compute, and the data has to exist before any metered pricing is possible.
+
+Covered by `npm run test:lifecycle`: a `SUCCESS` with no model version is refused, provenance round-trips into the database, and the recall query isolates exactly the affected job. Confirmed end to end against the live worker, which stamps `irismono-seg-sim-0.1.0` and its host:pid.
+
+**Status update.** All eight defect fixes have been applied, plus the credit ledger and job provenance from the design critique. Five suites cover the result: `test:flow`, `test:rls`, `test:lifecycle`, `test:credits`, and the ad-hoc verification described above. The backend compiles, starts, and passes `src/test-flow.ts` end to end — registration, domain whitelist enforcement, credit reservation, queue dispatch, GPU worker completion, and invite revocation all behave as specified, with the organization balance moving 3 → 2 on one successful job.
 
 Additionally verified against the running stack: the SSE stream rejects an unauthenticated connection (401) and accepts a stream token, which is itself refused as a Bearer credential (403); a browser-side stream client receives both the `PROCESSING` and `SUCCESS` events the worker reports, confirming the notification path is genuinely restored; job images are served to their own tenant (200), refused anonymously (401), and refused across tenants (404); the worker report endpoint rejects a bad secret (401) and refuses a replayed report (409) without moving the balance.
 

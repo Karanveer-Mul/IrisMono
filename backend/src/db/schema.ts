@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, integer, text, boolean, timestamp, pgEnum } from "drizzle-orm/pg-core";
+import { pgTable, uuid, varchar, integer, text, boolean, timestamp, pgEnum, doublePrecision } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 
 // Custom enums
@@ -59,6 +59,12 @@ export const jobs = pgTable("jobs", {
   rawImageS3Key: varchar("raw_image_s3_key", { length: 512 }).notNull(),
   maskImageS3Key: varchar("mask_image_s3_key", { length: 512 }),
   errorMessage: text("error_message"),
+  // Provenance. Which model produced this mask, on which worker, at what
+  // compute cost. modelVersion is required on any SUCCESS - a mask whose
+  // origin is unknown cannot be recalled if that model is later withdrawn.
+  modelVersion: varchar("model_version", { length: 100 }),
+  workerId: varchar("worker_id", { length: 100 }),
+  gpuSeconds: doublePrecision("gpu_seconds"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   // Set when a worker claims the job. PROCESSING is aged from here, not from
   // created_at, so a long queue wait is not mistaken for a stalled worker.
