@@ -126,6 +126,7 @@ npm run test:identity    # one account across organizations, role per membership
 npm run test:sse         # cross-instance delivery and Last-Event-ID replay
 npm run test:observability  # probes, metrics, fleet visibility, correlation ids
 npm run test:security    # audit chain, invite caps, encryption at rest, lockout
+npm run test:retention   # deletes refused as superuser, workspace closure, deactivation
 ```
 
 `test:sse` needs a **second API instance**, because a single-process test cannot distinguish a working bus from the in-process hub it replaced:
@@ -193,6 +194,7 @@ Storage and the ML model are both mocked for local development. Images go to `./
 - **The audit log is append-only and tamper-evident.** `audit_events` is hash-chained. `UPDATE`/`DELETE` are revoked from the application roles, a trigger blocks them for the owner too, and `GET /api/audit/verify` recomputes the chain and names the first row that does not verify. Sign-ins, invite activity (including every refusal and its reason), whitelist changes, and **every read of a scan** are recorded.
 - **Invite links expire and run out.** Default 25 uses and 30 days when unspecified, enforced by a `CHECK` constraint as well as by the handler, and `memberships.invite_id` records which link admitted whom.
 - **Sign-ins are throttled.** Five failures lock an account for 15 minutes, counted in the database so the limit does not divide by the number of API instances. Passwords are length-first: 12 characters minimum.
+- **The record cannot be deleted out from under itself.** Jobs, ledger entries, and the invites that admitted people reference their parents with `ON DELETE RESTRICT`, so deleting an organization or a user is refused rather than cascaded — including for a superuser at a `psql` prompt. Removing a customer is closure (`DELETE /api/auth/organization`, ORG_ADMIN), which stops the tenant acting and keeps everything else. Closure is not erasure: a tenant asking for their data to be destroyed is served by destroying their data key, which leaves the billing and audit metadata that must be retained. There is deliberately no button for closure in the dashboard — it is an API call, and an irreversible-looking one next to the upload form invites the accident it is hard to undo.
 
 Generate a master key with:
 

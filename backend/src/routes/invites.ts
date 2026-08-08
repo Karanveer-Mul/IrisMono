@@ -5,6 +5,7 @@ import { eq, and } from "drizzle-orm";
 import { authenticateJWT, AuthenticatedRequest, requireRole } from "../middleware/auth";
 import { randomUUID } from "crypto";
 import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
+import { assertOrganizationActive, OrganizationClosed } from "../lifecycle";
 
 const router = ExpressRouter();
 
@@ -49,6 +50,10 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
       : new Date(Date.now() + DEFAULT_INVITE_DAYS * 24 * 60 * 60 * 1000);
 
     const newInvite = await withTenant(orgId, async (tx) => {
+      // A closed workspace does not issue new links. The redemption path
+      // refuses them too, so this only stops a dead link being handed out.
+      await assertOrganizationActive(tx, orgId);
+
       // Use organization allowed domains as default if none specified
       let finalDomains = allowedDomains;
       if (!finalDomains || !Array.isArray(finalDomains)) {
@@ -95,6 +100,9 @@ router.post("/", async (req: AuthenticatedRequest, res: Response) => {
     });
 
   } catch (error) {
+    if (error instanceof OrganizationClosed) {
+      return res.status(410).json({ error: "This workspace has been closed" });
+    }
     console.error("Failed to create invite:", error);
     return res.status(500).json({ error: "Failed to generate invite link" });
   }

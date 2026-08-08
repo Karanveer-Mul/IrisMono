@@ -23,6 +23,11 @@ export const organizations = pgTable("organizations", {
   allowedDomains: text("allowed_domains").array().notNull().default(sql`'{}'::text[]`),
   // Which pool of GPU workers serves this tenant.
   infrastructureTier: infrastructureTierEnum("infrastructure_tier").notNull().default("STANDARD"),
+  // Closure, not deletion. Jobs and ledger entries reference this row with
+  // ON DELETE RESTRICT, so the database refuses to erase a tenant that has any
+  // history - and every tenant has history from its trial grant onward. See
+  // migration 0011.
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -40,6 +45,10 @@ export const users = pgTable("users", {
   failedLoginCount: integer("failed_login_count").notNull().default(0),
   lockedUntil: timestamp("locked_until", { withTimezone: true }),
   lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+  // As with organizations: a person who has run a single job cannot be deleted,
+  // because that job is a clinical record and the account is its provenance.
+  // Deactivation is what "remove this user" means here.
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -54,15 +63,17 @@ export const memberships = pgTable("memberships", {
   organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
   role: userRoleEnum("role").notNull().default("MEMBER"),
   // Which invite link admitted this person, when one did. Null for the founder
-  // of a workspace and for memberships created before migration 0010.
-  inviteId: uuid("invite_id"),
+  // of a workspace and for memberships created before migration 0010. RESTRICT
+  // since 0011: under the original SET NULL, deleting the link rewrote this to
+  // "joined without an invite" rather than failing.
+  inviteId: uuid("invite_id").references(() => organizationInvites.id, { onDelete: "restrict" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 // 3. Organization Invites
 export const organizationInvites = pgTable("organization_invites", {
   id: uuid("id").primaryKey().defaultRandom(),
-  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "restrict" }),
   inviteCode: varchar("invite_code", { length: 100 }).unique().notNull(),
   allowedDomains: text("allowed_domains").array().notNull().default(sql`'{}'::text[]`),
   isActive: boolean("is_active").notNull().default(true),
@@ -79,8 +90,10 @@ export const organizationInvites = pgTable("organization_invites", {
 // 4. Jobs
 export const jobs = pgTable("jobs", {
   id: uuid("id").primaryKey().defaultRandom(),
-  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
-  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // RESTRICT, not cascade: this row is the clinical and billing record, and
+  // deleting the tenant must fail rather than quietly take it along (0011).
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "restrict" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "restrict" }),
   status: jobStatusEnum("status").notNull().default("PENDING"),
   rawImageS3Key: varchar("raw_image_s3_key", { length: 512 }).notNull(),
   maskImageS3Key: varchar("mask_image_s3_key", { length: 512 }),
@@ -107,9 +120,11 @@ export const jobs = pgTable("jobs", {
 // rows, not the source of truth - see migration 0004 and src/credits.ts.
 export const creditTransactions = pgTable("credit_transactions", {
   id: uuid("id").primaryKey().defaultRandom(),
-  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "cascade" }),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id, { onDelete: "restrict" }),
   // Null for grants and manual adjustments, which are not tied to a job.
-  jobId: uuid("job_id").references(() => jobs.id, { onDelete: "cascade" }),
+  // RESTRICT: deleting a job used to delete its reservation and its refund,
+  // which is how a ledger stops reconciling against the balance it explains.
+  jobId: uuid("job_id").references(() => jobs.id, { onDelete: "restrict" }),
   // Negative reserves, positive returns. Never zero.
   delta: integer("delta").notNull(),
   reason: creditReasonEnum("reason").notNull(),

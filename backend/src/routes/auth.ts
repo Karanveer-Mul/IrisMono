@@ -4,11 +4,12 @@ import { Router, Request, Response } from "express";
 // RLS-bypassing system identity. Everything with a known tenant uses withTenant.
 import { systemDb, withTenant } from "../db";
 import { organizations, users, memberships, organizationInvites } from "../db/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, isNull, sql } from "drizzle-orm";
 import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
 import { isEmailDomainAllowed, getEmailDomain } from "../utils/domain";
-import { authenticateJWT, AuthenticatedRequest, issueStreamToken } from "../middleware/auth";
+import { authenticateJWT, AuthenticatedRequest, issueStreamToken, requireRole } from "../middleware/auth";
+import { closeOrganization, reopenOrganization } from "../lifecycle";
 import { grantCredits } from "../credits";
 import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
 import { checkPasswordStrength, clearFailedLogins, registerFailedLogin } from "../passwords";
@@ -41,7 +42,15 @@ function issueSessionToken(user: { id: string; email: string }, orgId: string, r
   );
 }
 
-/** Every organization this person belongs to, with their role in each. */
+/**
+ * Every organization this person belongs to, with their role in each.
+ *
+ * Closed workspaces are excluded rather than deleted from memberships: the
+ * membership row is the answer to "who had access to this tenant", which
+ * outlives the tenant being switched off. Excluding here is also what makes
+ * closure effective - no new token can name an organization that does not
+ * appear in this list.
+ */
 async function membershipsOf(userId: string) {
   const rows = await systemDb
     .select({
@@ -51,7 +60,7 @@ async function membershipsOf(userId: string) {
     })
     .from(memberships)
     .innerJoin(organizations, eq(memberships.organizationId, organizations.id))
-    .where(eq(memberships.userId, userId));
+    .where(and(eq(memberships.userId, userId), isNull(organizations.deletedAt)));
 
   return rows;
 }
@@ -180,6 +189,25 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Invite link not found" });
     }
 
+    const inviteOrg = await systemDb.query.organizations.findFirst({
+      where: eq(organizations.id, invite.organizationId),
+    });
+
+    // A closed workspace's links stop working, including ones already in
+    // circulation. Closure that left a standing invite live would be a way to
+    // acquire a membership nobody is administering.
+    if (!inviteOrg || inviteOrg.deletedAt) {
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.INVITE_REJECTED,
+        organizationId: invite.organizationId,
+        actorEmail: email,
+        target: invite.inviteCode,
+        metadata: { reason: "organization_closed" },
+        ip: clientIp(req),
+      });
+      return res.status(410).json({ error: "This workspace is no longer accepting members" });
+    }
+
     /** Every refusal is recorded against the link, so probing is visible. */
     const rejectInvite = async (reason: string) => {
       await recordAuditEvent({
@@ -211,10 +239,7 @@ router.post("/join/:inviteCode", async (req: Request, res: Response) => {
     // the organization's.
     let allowedDomains = invite.allowedDomains;
     if (!allowedDomains || allowedDomains.length === 0) {
-      const org = await systemDb.query.organizations.findFirst({
-        where: eq(organizations.id, invite.organizationId),
-      });
-      allowedDomains = org?.allowedDomains || [];
+      allowedDomains = inviteOrg.allowedDomains || [];
     }
 
     if (!isEmailDomainAllowed(email, allowedDomains)) {
@@ -398,6 +423,23 @@ router.post("/login", async (req: Request, res: Response) => {
     // run of guesses, not to accumulate over months of ordinary typos.
     await clearFailedLogins(user.id);
 
+    // Checked after the password rather than before it. Deactivation is not a
+    // secret worth protecting from the account's owner, but it is one worth
+    // protecting from someone guessing addresses: answering differently before
+    // the password is verified turns login into a directory of who used to work
+    // here. The account row survives because jobs reference it (migration 0011).
+    if (user.deletedAt) {
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.LOGIN_BLOCKED,
+        actorUserId: user.id,
+        actorEmail: user.email,
+        target: user.email,
+        metadata: { reason: "account_deactivated" },
+        ip: clientIp(req),
+      });
+      return res.status(403).json({ error: "This account has been deactivated." });
+    }
+
     const list = await membershipsOf(user.id);
 
     if (list.length === 0) {
@@ -501,6 +543,17 @@ router.post("/switch-organization", authenticateJWT, async (req: AuthenticatedRe
       return res.status(403).json({ error: "You are not a member of that organization" });
     }
 
+    const target = await systemDb.query.organizations.findFirst({
+      where: eq(organizations.id, organizationId),
+    });
+
+    // Re-checked here and not only in membershipsOf: this route takes the
+    // organization id from the request body, so a client holding an id from
+    // before the closure could otherwise mint a fresh token naming it.
+    if (!target || target.deletedAt) {
+      return res.status(410).json({ error: "That workspace has been closed" });
+    }
+
     const user = await systemDb.query.users.findFirst({ where: eq(users.id, userId) });
     if (!user) {
       return res.status(404).json({ error: "User not found" });
@@ -535,5 +588,96 @@ router.post("/switch-organization", authenticateJWT, async (req: AuthenticatedRe
 router.post("/stream-token", authenticateJWT, (req: AuthenticatedRequest, res: Response) => {
   return res.status(200).json({ token: issueStreamToken(req.user!) });
 });
+
+/**
+ * 8. Close the active workspace
+ *
+ * DELETE, because that is what the caller means and what the client will call
+ * it - but the row is not deleted and cannot be. Jobs and ledger entries
+ * reference it with ON DELETE RESTRICT (migration 0011), so the record that
+ * arch.md promises to keep indefinitely survives the customer leaving.
+ *
+ * Restricted to ORG_ADMIN of the workspace being closed: the role comes from
+ * the token, which is scoped to one organization, so an administrator of one
+ * tenant cannot close another.
+ */
+router.delete(
+  "/organization",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+
+    try {
+      const result = await closeOrganization(orgId);
+
+      // Recorded on the first closure only. A repeated call is a no-op, and an
+      // audit trail that shows three closures where one happened is misleading
+      // in the direction that matters.
+      if (result.changed) {
+        await recordAuditEvent({
+          action: AUDIT_ACTIONS.ORGANIZATION_CLOSED,
+          organizationId: orgId,
+          actorUserId: req.user!.id,
+          actorEmail: req.user!.email,
+          target: orgId,
+          metadata: { closedAt: result.closedAt },
+          ip: clientIp(req),
+        });
+      }
+
+      return res.status(200).json({
+        closed: true,
+        closedAt: result.closedAt,
+        alreadyClosed: !result.changed,
+        // Said plainly, because a caller who believes this erased their data
+        // has been misled by the verb.
+        note: "The workspace is closed. Jobs, credit history, and audit records are retained.",
+      });
+    } catch (error) {
+      console.error("Workspace closure error:", error);
+      return res.status(500).json({ error: "Failed to close workspace" });
+    }
+  }
+);
+
+/**
+ * 9. Reopen a workspace closed by mistake
+ *
+ * Only reachable with a token minted before the closure, since a closed
+ * organization no longer appears in membershipsOf and no new token can name it.
+ * That bounds this to the session that closed it - the case it is for. After
+ * that it is an operator action, deliberately.
+ */
+router.post(
+  "/organization/reopen",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+
+    try {
+      const reopened = await reopenOrganization(orgId);
+
+      if (!reopened) {
+        return res.status(409).json({ error: "That workspace is not closed" });
+      }
+
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.ORGANIZATION_REOPENED,
+        organizationId: orgId,
+        actorUserId: req.user!.id,
+        actorEmail: req.user!.email,
+        target: orgId,
+        ip: clientIp(req),
+      });
+
+      return res.status(200).json({ reopened: true });
+    } catch (error) {
+      console.error("Workspace reopen error:", error);
+      return res.status(500).json({ error: "Failed to reopen workspace" });
+    }
+  }
+);
 
 export default router;

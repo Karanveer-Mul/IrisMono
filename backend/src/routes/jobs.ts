@@ -23,6 +23,7 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "crypto";
 import { reserveCredit, refundCredit, InsufficientCredits } from "../credits";
+import { assertOrganizationActive, OrganizationClosed } from "../lifecycle";
 import {
   jobDuration,
   jobGpuSeconds,
@@ -604,6 +605,11 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
   try {
     // Start transactional credit checking & reservation
     const result = await withTenant(orgId, async (tx) => {
+      // Inside the transaction, so the workspace cannot close between the check
+      // and the reservation. A closed workspace that could still spend credits
+      // would keep billing after the customer stopped.
+      await assertOrganizationActive(tx, orgId);
+
       const jobId = randomUUID();
       const s3Key = `org_id=${orgId}/jobs/${jobId}/raw.png`;
 
@@ -653,6 +659,9 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
   } catch (error: any) {
     if (error instanceof InsufficientCredits) {
       return res.status(402).json({ error: "Insufficient organization credits remaining to start a new job." });
+    }
+    if (error instanceof OrganizationClosed) {
+      return res.status(410).json({ error: "This workspace has been closed and cannot start new jobs." });
     }
     console.error("Queue job request error:", error);
     return res.status(500).json({ error: error.message || "Failed to initiate job" });

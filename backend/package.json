@@ -17,7 +17,8 @@
     "test:sse": "tsx src/test-sse.ts",
     "test:identity": "tsx src/test-identity.ts",
     "test:observability": "tsx src/test-observability.ts",
-    "test:security": "tsx src/test-security.ts"
+    "test:security": "tsx src/test-security.ts",
+    "test:retention": "tsx src/test-retention.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",
