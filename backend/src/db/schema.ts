@@ -37,6 +37,9 @@ export const organizations = pgTable("organizations", {
   // enrolment until they have one. Not enforced retroactively on live tokens -
   // it applies at the next sign-in or organization switch. See migration 0014.
   requireMfa: boolean("require_mfa").notNull().default(false),
+  // Sessions issued before this instant are refused for everyone in this
+  // workspace. The blunt instrument, for an incident. See migration 0015.
+  sessionsInvalidBefore: timestamp("sessions_invalid_before", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -66,6 +69,9 @@ export const users = pgTable("users", {
   // because that job is a clinical record and the account is its provenance.
   // Deactivation is what "remove this user" means here.
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  // Every session this person holds, anywhere, issued before this instant is
+  // refused. Set by "sign out everywhere" and by deactivation. See 0015.
+  sessionsInvalidBefore: timestamp("sessions_invalid_before", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -84,6 +90,11 @@ export const memberships = pgTable("memberships", {
   // since 0011: under the original SET NULL, deleting the link rewrote this to
   // "joined without an invite" rather than failing.
   inviteId: uuid("invite_id").references(() => organizationInvites.id, { onDelete: "restrict" }),
+  // Sessions this person holds *in this workspace*, issued before this instant,
+  // are refused. Scoped here rather than on the user because an administrator's
+  // reach ends at their own tenant - cutting someone off here must not touch
+  // the other hospitals they work for. See migration 0015.
+  sessionsInvalidBefore: timestamp("sessions_invalid_before", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

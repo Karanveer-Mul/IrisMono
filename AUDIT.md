@@ -585,6 +585,24 @@ Closed workspaces are deliberately not exempt: closure is not a reason to keep i
 
 `npm run test:retention` covers this in checks 11–14 — the bounds are probed (0, 4000, and 7.5 days all refused), two jobs of identical age in different tenants are aged in the database and swept, and only the seven-day tenant's scan is deleted while the one on the platform default survives. A second sweep is asserted to find nothing, the expired scan is asserted to answer 410 with its purge date, and the change of window is asserted to appear in the audit trail with the value it replaced.
 
+### Sessions that can be ended (migration 0015)
+
+Everything built above took effect at the next sign-in. Deactivating an account, closing a workspace, removing someone from one, demoting an administrator, turning on the MFA requirement — each changed a row, and each was invisible to a token already in circulation for up to 24 hours. That is the wrong side of every incident this product will have: whoever holds a stolen token is the one person who will not sign in again, and "revoke this person's access now" is what a hospital asks on the day someone leaves or a laptop goes missing.
+
+The cause was treating the JWT as an authorization decision rather than an assertion of identity. It now carries who you are and which workspace you are acting in, and nothing else is believed: `checkSession` reads the membership row, its role, and the deactivation and revocation state of all three levels on every authenticated request. Role and MFA restriction come from that read, so a demotion binds the open session and a new MFA requirement restricts it immediately instead of a day later. `npm run test:sessions` check 6 is the pointed one — the token claims `MEMBER` throughout while an ORG_ADMIN-only call succeeds and then stops succeeding, which is only possible if the claim is being ignored.
+
+That is one indexed lookup per request, against `uq_membership_user_org`, which already existed. The alternative — trusting the token and accepting a revocation window — is a cache with a 24-hour TTL and no invalidation, described as a design.
+
+Revocation itself is three cut-off timestamps, each at the scope of the person doing the revoking: `users` (this person, everywhere they act — "sign out everywhere", for a lost device), `memberships` (one person in one workspace, which is exactly an admin's reach), and `organizations` (everyone here, for an incident). A token is refused when it was minted before any cut-off that applies to it. Scoping the admin's control to the membership rather than the user is the load-bearing choice: a radiologist may work for several hospitals through one account, and an administrator at one of them ending sessions at the others would be an escalation past the tenant boundary. Check 3 asserts precisely that.
+
+Tokens now carry `mit`, a millisecond mint time, because `iat` is whole seconds and cannot separate a token minted just before a revocation from the one minted just after — and "sign out everywhere, then sign in again" is that, a few hundred milliseconds apart. Second resolution made the test fail in both directions before this was added: strict comparison refused the session the user had just signed in to get, and tolerant comparison let the revoked one through.
+
+Closure is deliberately **not** enforced in this gate. It stops the tenant *acting*, which is enforced inside the writing transactions where it always was; refusing the session outright would lock out the administrator who closed it — the only person who can reopen it, and the one most likely to be exporting records during a wind-down. Check 11 pins that: profile 200, a write 410, reopen 200.
+
+One thing this deliberately does not do: a stale `restricted` claim on a token is fail-closed, not fail-open. The live check binds the *on* direction immediately; a session issued while the policy was on keeps its claim in the interface until the next sign-in, which inconveniences someone rather than exposing anything. `GET /api/auth/mfa` reports the live value so the enrolment screen can say the requirement was lifted rather than holding someone there.
+
+Two controls reach the browser: "Sign out everywhere" in the Security panel, and "Sign everyone out" in the Workspace panel for an admin. `apiFetch` now drops the token and returns to sign-in on any 401 that carried one — sign-in itself carries no token, so a wrong password is unaffected.
+
 ### Workspace administration in the browser
 
 Retention and closure were API-only, which is a gap of the same kind the audit keeps finding elsewhere: a control that exists but that the person accountable for it cannot reach. Retention is a term in a hospital's contract and the administrator who signed it should be able to read and change the number without a support ticket, and a customer winding down should not have to ask someone else to run a `DELETE` on their behalf.

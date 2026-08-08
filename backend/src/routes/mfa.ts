@@ -63,6 +63,11 @@ router.get("/", authenticateJWT, async (req: AuthenticatedRequest, res: Response
       enabledAt: user?.mfaEnabledAt ?? null,
       pending: !!user?.mfaSecret && !user?.mfaEnabledAt,
       recoveryCodesRemaining: remaining.length,
+      // Live, from the workspace's current policy. A session's restricted claim
+      // is decided when the token is minted, so it can outlive the requirement
+      // that caused it - this is how the enrolment screen can tell someone the
+      // requirement was lifted instead of holding them there.
+      restricted: !!req.user!.restricted,
     });
   } catch (error) {
     console.error("MFA status error:", error);

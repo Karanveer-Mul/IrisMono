@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import * as jwt from "jsonwebtoken";
+import { checkSession } from "../session";
 
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-change-in-production";
 
@@ -38,12 +39,20 @@ export interface AuthenticatedRequest extends Request {
  */
 interface SessionClaims extends AuthUser {
   purpose?: "stream" | "mfa";
+  /** Issued-at, in whole seconds. Set by jsonwebtoken. */
+  iat?: number;
+  /** Minted-at, in milliseconds. Ours, because `iat` is too coarse to revoke by. */
+  mit?: number;
 }
 
 /** Lifetime of an MFA challenge token. Long enough to open an app, no longer. */
 const MFA_TOKEN_TTL_SECONDS = 300;
 
-export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function authenticateJWT(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -52,9 +61,18 @@ export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: 
 
   const token = authHeader.split(" ")[1];
 
+  // Only the signature check belongs in this try. Widening it to cover the
+  // database lookup below turns any infrastructure failure into "Invalid or
+  // expired access token", which sends whoever is debugging it to look at the
+  // client - as it did once already while this was being written.
+  let decoded: SessionClaims;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as SessionClaims;
+    decoded = jwt.verify(token, JWT_SECRET) as SessionClaims;
+  } catch {
+    return res.status(403).json({ error: "Invalid or expired access token" });
+  }
 
+  try {
     // Anything with a purpose is a narrow credential and is refused here, by
     // default rather than by enumeration. A stream token leaks easily (it rides
     // in a query string, so it lands in access logs and Referer headers); an
@@ -64,6 +82,16 @@ export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: 
       return res.status(403).json({
         error: `Tokens issued for ${decoded.purpose} cannot be used for API access`,
       });
+    }
+
+    // What the token asserts is who this is and where they are acting. What
+    // they may do there is read from the database, every request, because the
+    // token cannot know anything that happened after it was signed - a closed
+    // workspace, a revoked session, a removed membership, a demotion.
+    const state = await checkSession(decoded.id, decoded.organizationId, decoded);
+
+    if (!state.ok) {
+      return res.status(state.status).json({ error: state.error, ...(state.extra ?? {}) });
     }
 
     // A restricted session can reach MFA enrolment and nothing else.
@@ -78,17 +106,29 @@ export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: 
     // turns on the requirement locks out every member who has not enrolled, and
     // enrolling needs a session - so refusing one outright would leave them
     // with no way in at all.
-    if (decoded.restricted && !req.baseUrl.startsWith("/api/auth/mfa")) {
+    if (state.restricted && !req.baseUrl.startsWith("/api/auth/mfa")) {
       return res.status(403).json({
         error: "This organization requires multi-factor authentication. Enrol before continuing.",
         mfaEnrolmentRequired: true,
       });
     }
 
-    req.user = decoded;
+    // Role and restriction come from the database rather than the token, so a
+    // demotion or a new MFA requirement binds the sessions that already exist.
+    req.user = {
+      id: decoded.id,
+      email: decoded.email,
+      organizationId: decoded.organizationId,
+      role: state.role,
+      ...(state.restricted ? { restricted: true } : {}),
+    };
     next();
   } catch (error) {
-    return res.status(403).json({ error: "Invalid or expired access token" });
+    // The token was good and the check itself failed. Refusing is still right -
+    // an authorization decision that cannot be made must not default to yes -
+    // but it is reported as ours, and loudly, rather than blamed on the caller.
+    console.error("Session check failed:", error);
+    return res.status(503).json({ error: "Could not verify this session. Try again." });
   }
 }
 
@@ -107,6 +147,10 @@ export function issueStreamToken(user: AuthUser): string {
       organizationId: user.organizationId,
       role: user.role,
       purpose: "stream",
+      // Same millisecond claim as a session token: this is checked against the
+      // revocation cut-offs too, and a stream reconnecting is one of the paths
+      // a revoked session would otherwise slip back in through.
+      mit: Date.now(),
     },
     JWT_SECRET,
     { expiresIn: STREAM_TOKEN_TTL_SECONDS }
@@ -147,7 +191,11 @@ export function readMfaChallengeToken(token: string): MfaChallenge | null {
  * Authenticates an endpoint by `?token=` instead of the Authorization header.
  * Only accepts tokens minted by issueStreamToken.
  */
-export function authenticateStreamToken(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function authenticateStreamToken(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) {
   const token = typeof req.query.token === "string" ? req.query.token : null;
 
   if (!token) {
@@ -161,7 +209,16 @@ export function authenticateStreamToken(req: AuthenticatedRequest, res: Response
       return res.status(403).json({ error: "Token is not valid for stream access" });
     }
 
-    req.user = decoded;
+    // Same gate as the header path. A stream is long-lived once open, so the
+    // check at connect time is the only one it gets - and a revoked session
+    // reconnecting is exactly the case this has to refuse.
+    const state = await checkSession(decoded.id, decoded.organizationId, decoded);
+
+    if (!state.ok) {
+      return res.status(state.status).json({ error: state.error, ...(state.extra ?? {}) });
+    }
+
+    req.user = { ...decoded, role: state.role };
     next();
   } catch (error) {
     return res.status(403).json({ error: "Invalid or expired stream token" });

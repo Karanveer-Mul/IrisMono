@@ -126,6 +126,18 @@ export async function apiFetch(path: string, options: ApiOptions = {}) {
     data = await response.json();
   }
 
+  // A 401 on a request that carried a token means the token is no longer a
+  // session: it was revoked, or the account was deactivated. Holding on to it
+  // would leave the interface signed in against a server that disagrees, so it
+  // is dropped and the shell falls back to the sign-in screen. Sign-in itself
+  // carries no token, so a wrong password does not come through here.
+  if (response.status === 401 && token) {
+    removeToken();
+    if (typeof window !== "undefined") {
+      window.location.reload();
+    }
+  }
+
   if (!response.ok) {
     const errorMessage = data?.error || `Request failed with status ${response.status}`;
     throw new Error(errorMessage);

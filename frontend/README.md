@@ -32,8 +32,8 @@ components/
   Auth.tsx              sign in / create workspace / join team
   MfaChallenge.tsx      second step of a sign-in: code or recovery code
   MfaEnrolment.tsx      two-step enrolment, then the recovery codes
-  SecurityPanel.tsx     MFA on/off, and the org-wide requirement (ORG_ADMIN)
-  WorkspacePanel.tsx    retention window, workspace closure and reopening (ORG_ADMIN)
+  SecurityPanel.tsx     MFA on/off, sign out everywhere, org-wide requirement (ORG_ADMIN)
+  WorkspacePanel.tsx    retention, sign everyone out, closure and reopening (ORG_ADMIN)
   Dashboard.tsx         credits, job history, SSE subscription
   MaskUploader.tsx      drag-drop upload, job status, result preview
   InviteManager.tsx     domain whitelist + reusable invite links (ORG_ADMIN)
@@ -56,6 +56,8 @@ Notable changes from the Vite version:
 **Job images are fetched as blobs.** `GET /api/jobs/:jobId/image/:kind` is tenant-scoped behind the normal session, which an `<img src>` cannot satisfy, so `JobImage.tsx` fetches the bytes with the token attached and renders an object URL.
 
 **A restricted session is gated in the shell, not the dashboard.** When an organization requires MFA and the account has no second factor, the sign-in succeeds but the token carries `restricted` and reaches only enrolment. `AppShell` reads that claim from the token — not from the sign-in response — so reloading the page lands on enrolment rather than on a dashboard whose every request will be refused. Finishing enrolment drops the token and returns to sign-in, because the claim was baked in when the token was issued and only a fresh sign-in re-evaluates it.
+
+**Signing out here is not the same as ending a session.** Clicking Sign Out forgets the token; the token itself stays valid for the rest of its 24 hours. "Sign out everywhere" in the Security panel ends the sessions themselves, including the current one — which is what the button is for when a device is lost. `apiFetch` drops the token and returns to sign-in on any 401 that carried one, so a session revoked elsewhere lands on the sign-in screen at its next request rather than showing a dashboard that cannot load.
 
 **A closed workspace still renders the dashboard.** Closure sets `deleted_at`; the rows survive and so does the session that closed it, which is the only session that can reopen it — no new token can name a closed workspace. So the dashboard stays up behind a banner rather than throwing the administrator out, and `WorkspacePanel` says on screen that signing out ends the ability to undo. Closing asks for the workspace name to be typed, because the cost of the accident is every member losing access at once.
 

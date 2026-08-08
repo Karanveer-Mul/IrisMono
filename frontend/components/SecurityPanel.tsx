@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, removeToken } from "@/lib/api";
 import type { UserContext } from "@/lib/api";
 import { MfaEnrolment } from "./MfaEnrolment";
 import { ShieldCheck, ShieldOff, Users } from "lucide-react";
@@ -53,6 +53,27 @@ export function SecurityPanel({ user, requireMfa, onPolicyChanged }: SecurityPan
     } catch (err: any) {
       setError(err.message || "Could not turn off two-factor");
     } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Ends every session this account holds, in every workspace.
+   *
+   * Signing out in the browser only forgets the token; the token stays valid
+   * for the rest of its 24 hours, which is no help in the case this is for -
+   * a laptop left somewhere. This one ends the sessions themselves, including
+   * the one clicking it.
+   */
+  const signOutEverywhere = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await apiFetch("/api/auth/sessions/revoke", { method: "POST" });
+      removeToken();
+      window.location.reload();
+    } catch (err: any) {
+      setError(err.message || "Could not end your sessions");
       setBusy(false);
     }
   };
@@ -158,6 +179,22 @@ export function SecurityPanel({ user, requireMfa, onPolicyChanged }: SecurityPan
             </button>
           </>
         )}
+      </div>
+
+      <div
+        style={{
+          borderTop: "1px solid rgba(255,255,255,0.06)",
+          paddingTop: "1.25rem",
+          marginBottom: user.role === "ORG_ADMIN" ? "1.5rem" : 0,
+        }}
+      >
+        <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginBottom: "0.6rem" }}>
+          Signing out here only forgets the token on this device — it stays valid for up to a day.
+          If a device is lost, end the sessions themselves.
+        </p>
+        <button className="btn" id="revoke-sessions-btn" disabled={busy} onClick={signOutEverywhere}>
+          Sign out everywhere
+        </button>
       </div>
 
       {user.role === "ORG_ADMIN" && (

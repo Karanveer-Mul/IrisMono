@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, removeToken } from "@/lib/api";
 import { Archive, RotateCcw, Timer } from "lucide-react";
 
 interface WorkspacePanelProps {
@@ -71,6 +71,19 @@ export function WorkspacePanel({ org, platformRetentionDays, onChanged }: Worksp
     } catch (err: any) {
       setError(err.message || "Could not close the workspace");
     } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeEveryone = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await apiFetch("/api/auth/organization/sessions/revoke", { method: "POST" });
+      removeToken();
+      window.location.reload();
+    } catch (err: any) {
+      setError(err.message || "Could not end the sessions");
       setBusy(false);
     }
   };
@@ -190,6 +203,25 @@ export function WorkspacePanel({ org, platformRetentionDays, onChanged }: Worksp
                 </button>
               )}
             </form>
+          </div>
+
+          {/* Incident response: a shared credential, a suspected compromise, a
+              contractor engagement that ended. Blunt on purpose - picking which
+              sessions are the bad ones is exactly what nobody can do at the
+              moment they need this. */}
+          <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "1.25rem", marginBottom: "1.5rem" }}>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginBottom: "0.6rem" }}>
+              Signs out everyone in this workspace immediately, including you. They can sign back
+              in — this ends sessions, it does not disable accounts.
+            </p>
+            <button
+              className="btn"
+              id="workspace-revoke-btn"
+              disabled={busy}
+              onClick={revokeEveryone}
+            >
+              Sign everyone out
+            </button>
           </div>
 
           <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "1.25rem" }}>

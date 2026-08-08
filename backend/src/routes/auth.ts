@@ -811,4 +811,147 @@ router.post(
   }
 );
 
+/**
+ * 12. End every session this person holds
+ *
+ * "Sign out everywhere", for a laptop left somewhere. Signing out in the
+ * browser only forgets the token; the token itself stays valid for the rest of
+ * its 24 hours, which is no help at all in the case the button is for.
+ *
+ * Not scoped to the current workspace: a lost device holds whatever sessions it
+ * holds, and cutting off one tenant while leaving the others is not what the
+ * person clicking this means.
+ */
+router.post("/sessions/revoke", authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    await systemDb
+      .update(users)
+      .set({ sessionsInvalidBefore: sql`NOW()`, updatedAt: new Date() })
+      .where(eq(users.id, req.user!.id));
+
+    await recordAuditEvent({
+      action: AUDIT_ACTIONS.SESSIONS_REVOKED,
+      organizationId: req.user!.organizationId,
+      actorUserId: req.user!.id,
+      actorEmail: req.user!.email,
+      target: req.user!.email,
+      metadata: { scope: "self" },
+      ip: clientIp(req),
+    });
+
+    // Including the one making the request. A "sign out everywhere" that kept
+    // the current session alive would be answering a different question.
+    return res.status(200).json({ revoked: true, note: "All sessions ended, including this one." });
+  } catch (error) {
+    console.error("Session revocation error:", error);
+    return res.status(500).json({ error: "Failed to end sessions" });
+  }
+});
+
+/**
+ * 13. End one member's sessions in this workspace
+ *
+ * The reach an administrator actually has. A person may work for several
+ * hospitals through the same account, and an admin at one of them cutting off
+ * the others would be an escalation - so the cut-off is written on the
+ * membership, not on the user.
+ */
+router.post(
+  "/members/:userId/sessions/revoke",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+    const { userId } = req.params;
+
+    // Checked here rather than left to Postgres: a malformed id is a client
+    // mistake, and 22P02 surfacing as a 500 hides it behind an outage.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+      return res.status(400).json({ error: "That is not a user id" });
+    }
+
+    try {
+      // Under RLS, so the tenant scope is enforced by the database as well as by
+      // the predicate - an admin revoking sessions cannot reach another
+      // workspace's membership rows even if the id in the path names one.
+      const updated = await withTenant(orgId, async (tx) => {
+        await assertOrganizationActive(tx, orgId);
+        return tx
+          .update(memberships)
+          .set({ sessionsInvalidBefore: sql`NOW()` })
+          .where(and(eq(memberships.userId, userId), eq(memberships.organizationId, orgId)))
+          .returning({ id: memberships.id });
+      });
+
+      if (updated.length === 0) {
+        return res.status(404).json({ error: "That person is not a member of this workspace" });
+      }
+
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.MEMBER_SESSIONS_REVOKED,
+        organizationId: orgId,
+        actorUserId: req.user!.id,
+        actorEmail: req.user!.email,
+        target: userId,
+        ip: clientIp(req),
+      });
+
+      return res.status(200).json({ revoked: true });
+    } catch (error) {
+      if (error instanceof OrganizationClosed) {
+        return res.status(410).json({ error: "This workspace has been closed" });
+      }
+      console.error("Member session revocation error:", error);
+      return res.status(500).json({ error: "Failed to end that member's sessions" });
+    }
+  }
+);
+
+/**
+ * 14. End everyone's sessions in this workspace
+ *
+ * The incident-response instrument: a shared credential, a suspected
+ * compromise, a contractor engagement that ended. Blunt on purpose - deciding
+ * which sessions are the bad ones is exactly what nobody can do at the moment
+ * they need this.
+ */
+router.post(
+  "/organization/sessions/revoke",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+
+    try {
+      await withTenant(orgId, async (tx) => {
+        await assertOrganizationActive(tx, orgId);
+        await tx
+          .update(organizations)
+          .set({ sessionsInvalidBefore: sql`NOW()`, updatedAt: new Date() })
+          .where(eq(organizations.id, orgId));
+      });
+
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.ORGANIZATION_SESSIONS_REVOKED,
+        organizationId: orgId,
+        actorUserId: req.user!.id,
+        actorEmail: req.user!.email,
+        target: orgId,
+        ip: clientIp(req),
+      });
+
+      return res.status(200).json({
+        revoked: true,
+        note: "Everyone signed in to this workspace has been signed out, including you.",
+      });
+    } catch (error) {
+      if (error instanceof OrganizationClosed) {
+        return res.status(410).json({ error: "This workspace has been closed" });
+      }
+      console.error("Workspace session revocation error:", error);
+      return res.status(500).json({ error: "Failed to end sessions" });
+    }
+  }
+);
+
 export default router;
