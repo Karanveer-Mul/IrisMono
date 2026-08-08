@@ -33,6 +33,10 @@ export const organizations = pgTable("organizations", {
   // preference tracks the deployment's policy instead of freezing today's
   // number into their row. See migration 0012.
   retentionDays: integer("retention_days"),
+  // When true, a member without a second factor gets a session restricted to
+  // enrolment until they have one. Not enforced retroactively on live tokens -
+  // it applies at the next sign-in or organization switch. See migration 0014.
+  requireMfa: boolean("require_mfa").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });

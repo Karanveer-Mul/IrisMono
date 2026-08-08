@@ -241,7 +241,90 @@ async function run() {
   const plain = await post("/auth/login", { email: user.email, password: user.password });
   assert(!!plain.body.token, "sign-in did not return to password-only after disabling");
 
-  console.log("\n12. Every step of it is in the audit trail");
+  console.log("\n12. An admin cannot require what they have not done themselves");
+  const policyDomain = `mfa-policy-${stamp}.example.org`;
+  const admin = await register(`mfa.admin.${stamp}@${policyDomain}`, `Policy Hospital ${stamp}`);
+
+  const premature = await call("PUT", "/auth/organization/mfa", { requireMfa: true }, admin.token);
+  console.log(`-> requiring MFA before enrolling in it: HTTP ${premature.status}`);
+  assert(premature.status === 409, "an admin without MFA could require it of everyone");
+
+  // A member who joined before the policy - the case the restriction is for.
+  const invite = await post("/invites", { maxUses: 5 }, admin.token);
+  assert(invite.status === 201, `invite failed: ${JSON.stringify(invite.body)}`);
+  const memberEmail = `mfa.member.${stamp}@${policyDomain}`;
+  const memberPassword = "correct-horse-battery-9";
+  const joined = await post(`/auth/join/${invite.body.invite.inviteCode}`, {
+    email: memberEmail,
+    password: memberPassword,
+  });
+  assert(joined.status === 201 || joined.status === 200, `join failed: ${JSON.stringify(joined.body)}`);
+
+  const adminSetup = await post("/auth/mfa/setup", {}, admin.token);
+  const adminSecret = adminSetup.body.secret as string;
+  const adminConfirm = await post("/auth/mfa/confirm", { code: totp(adminSecret, stepAt()) }, admin.token);
+  assert(adminConfirm.status === 200, `admin enrolment failed: ${JSON.stringify(adminConfirm.body)}`);
+
+  const policy = await call("PUT", "/auth/organization/mfa", { requireMfa: true }, admin.token);
+  console.log(`-> once enrolled: HTTP ${policy.status}, requireMfa ${policy.body.requireMfa}`);
+  assert(policy.status === 200 && policy.body.requireMfa === true, "the policy did not take");
+
+  console.log("\n13. A member without MFA gets a session that can only enrol");
+  const restricted = await post("/auth/login", { email: memberEmail, password: memberPassword });
+  console.log(`-> sign-in: HTTP ${restricted.status}, mfaEnrolmentRequired ${restricted.body.mfaEnrolmentRequired}`);
+  assert(restricted.body.mfaEnrolmentRequired === true, "the member was not told to enrol");
+  assert(!!restricted.body.token, "no session was issued, leaving the member no way to enrol");
+
+  const blockedWork = await post("/jobs/request", {}, restricted.body.token);
+  const blockedProfile = await get("/auth/profile", restricted.body.token);
+  console.log(`-> queueing a job: HTTP ${blockedWork.status}, profile: HTTP ${blockedProfile.status}`);
+  assert(blockedWork.status === 403, `a restricted session queued a job (HTTP ${blockedWork.status})`);
+  assert(blockedWork.body.mfaEnrolmentRequired === true, "the refusal does not say why");
+  assert(blockedProfile.status === 403, "a restricted session reached a general route");
+
+  console.log("\n14. Enrolment is reachable from that restricted session");
+  const memberSetup = await post("/auth/mfa/setup", {}, restricted.body.token);
+  console.log(`-> setup: HTTP ${memberSetup.status}`);
+  assert(memberSetup.status === 200, "the restricted session could not reach enrolment - a dead end");
+
+  const memberSecret = memberSetup.body.secret as string;
+  const memberConfirm = await post(
+    "/auth/mfa/confirm",
+    { code: totp(memberSecret, stepAt()) },
+    restricted.body.token
+  );
+  assert(memberConfirm.status === 200, `member enrolment failed: ${JSON.stringify(memberConfirm.body)}`);
+
+  const nowChallenged = await post("/auth/login", { email: memberEmail, password: memberPassword });
+  assert(nowChallenged.body.mfaRequired === true, "the enrolled member was not challenged");
+  const full = await post("/auth/mfa/verify", {
+    mfaToken: nowChallenged.body.mfaToken,
+    code: totp(memberSecret, stepAt() + 1),
+  });
+  console.log(`-> after enrolling: HTTP ${full.status}, restricted ${!!full.body.mfaEnrolmentRequired}`);
+  assert(full.status === 200 && !full.body.mfaEnrolmentRequired, "the session is still restricted after enrolling");
+
+  const nowWorks = await post("/jobs/request", {}, full.body.token);
+  console.log(`-> queueing a job: HTTP ${nowWorks.status}`);
+  assert(nowWorks.status === 200, "an enrolled member still cannot work");
+
+  console.log("\n15. Turning the policy off is recorded too");
+  const off = await call("PUT", "/auth/organization/mfa", { requireMfa: false }, admin.token);
+  assert(off.status === 200 && off.body.requireMfa === false, "the policy could not be turned off");
+
+  const policyTrail = await adminDb.execute(sql`
+    SELECT metadata FROM audit_events
+     WHERE action = 'organization.mfa.policy_changed' AND actor_user_id = ${admin.userId}
+     ORDER BY id ASC
+  `);
+  const transitions = (policyTrail.rows as any[]).map(
+    (r) => `${r.metadata.previous} -> ${r.metadata.requireMfa}`
+  );
+  console.log(`-> ${transitions.join(", ")}`);
+  assert(transitions.length === 2, "both policy changes were not recorded");
+  assert(transitions[0] === "false -> true" && transitions[1] === "true -> false", "the transitions are wrong");
+
+  console.log("\n16. Every step of it is in the audit trail");
   let trail: any[] = [];
   for (let attempt = 0; attempt < 10 && trail.length < 4; attempt++) {
     await new Promise((r) => setTimeout(r, 200));
@@ -269,14 +352,15 @@ async function run() {
   assert(recorded.some((f) => f.includes("totp")), "a TOTP sign-in was not recorded as one");
   assert(recorded.some((f) => f.includes("recovery_code")), "a recovery sign-in was not recorded as one");
 
-  console.log("\n13. The audit chain still verifies");
+  console.log("\n17. The audit chain still verifies");
   const chain = await verifyAuditChain();
   console.log(`-> ${chain.checked} event(s) checked, ok: ${chain.ok}`);
   assert(chain.ok, `the audit chain broke at row ${chain.brokenAt}: ${chain.reason}`);
 
   console.log("\n=== MFA VERIFIED ===");
   console.log("Enrolment cannot half-succeed, codes cannot be replayed, recovery codes work");
-  console.log("once, and the challenge token cannot be spent as a session.");
+  console.log("once, the challenge token cannot be spent as a session, and an organization");
+  console.log("can require a second factor without stranding the members who lack one.");
 }
 
 run()

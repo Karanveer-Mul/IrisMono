@@ -17,6 +17,12 @@ export interface AuthUser {
   email: string;
   organizationId: string;
   role: "ORG_ADMIN" | "MEMBER";
+  /**
+   * Set when the active organization requires a second factor and this person
+   * does not have one. The session is real but may only reach MFA enrolment -
+   * see authenticateJWT.
+   */
+  restricted?: boolean;
 }
 
 export interface AuthenticatedRequest extends Request {
@@ -57,6 +63,25 @@ export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: 
     if (decoded.purpose) {
       return res.status(403).json({
         error: `Tokens issued for ${decoded.purpose} cannot be used for API access`,
+      });
+    }
+
+    // A restricted session can reach MFA enrolment and nothing else.
+    //
+    // Enforced here, in the one place every authenticated route passes through,
+    // rather than by adding a guard to each router. Matching on the mount path
+    // is uglier than a per-route flag, and it is the right trade: the failure
+    // mode of the tidier design is a router someone forgot, which fails open on
+    // exactly the accounts the policy exists to cover.
+    //
+    // The restriction cannot include enrolment itself. An organization that
+    // turns on the requirement locks out every member who has not enrolled, and
+    // enrolling needs a session - so refusing one outright would leave them
+    // with no way in at all.
+    if (decoded.restricted && !req.baseUrl.startsWith("/api/auth/mfa")) {
+      return res.status(403).json({
+        error: "This organization requires multi-factor authentication. Enrol before continuing.",
+        mfaEnrolmentRequired: true,
       });
     }
 

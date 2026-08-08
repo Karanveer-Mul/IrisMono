@@ -14,7 +14,13 @@ import {
   issueStreamToken,
   requireRole,
 } from "../middleware/auth";
-import { completeSignIn, issueSessionToken, membershipsOf, NoMemberships } from "../session";
+import {
+  completeSignIn,
+  isRestricted,
+  issueSessionToken,
+  membershipsOf,
+  NoMemberships,
+} from "../session";
 import {
   assertOrganizationActive,
   closeOrganization,
@@ -538,8 +544,14 @@ router.post("/switch-organization", authenticateJWT, async (req: AuthenticatedRe
       ip: clientIp(req),
     });
 
+    // Re-evaluated per organization: the same person can be unrestricted in one
+    // workspace and restricted in another, because the requirement belongs to
+    // the tenant rather than to the account.
+    const restricted = await isRestricted(user, organizationId);
+
     return res.status(200).json({
-      token: issueSessionToken(user, organizationId, membership.role),
+      token: issueSessionToken(user, organizationId, membership.role, restricted),
+      ...(restricted ? { mfaEnrolmentRequired: true } : {}),
     });
   } catch (error) {
     console.error("Organization switch error:", error);
@@ -559,7 +571,79 @@ router.post("/stream-token", authenticateJWT, (req: AuthenticatedRequest, res: R
 });
 
 /**
- * 8. Set how long this workspace's scans are kept
+ * 8. Require a second factor of everyone in this workspace
+ *
+ * The administrator must have MFA themselves before they can require it. Not
+ * paternalism: whoever turns this on is restricted by it at their next sign-in
+ * like everyone else, and an admin who locked themselves into enrolment-only
+ * while a policy question was open is the first support call this feature would
+ * generate.
+ */
+router.put(
+  "/organization/mfa",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+    const { requireMfa } = req.body ?? {};
+
+    if (typeof requireMfa !== "boolean") {
+      return res.status(400).json({ error: "requireMfa must be true or false" });
+    }
+
+    try {
+      const actor = await systemDb.query.users.findFirst({ where: eq(users.id, req.user!.id) });
+
+      if (requireMfa && !actor?.mfaEnabledAt) {
+        return res.status(409).json({
+          error: "Enrol your own second factor before requiring it of everyone else.",
+        });
+      }
+
+      const previous = await withTenant(orgId, async (tx) => {
+        await assertOrganizationActive(tx, orgId);
+
+        const current = await tx.query.organizations.findFirst({
+          where: eq(organizations.id, orgId),
+        });
+
+        await tx
+          .update(organizations)
+          .set({ requireMfa, updatedAt: new Date() })
+          .where(eq(organizations.id, orgId));
+
+        return current?.requireMfa ?? false;
+      });
+
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.MFA_POLICY_CHANGED,
+        organizationId: orgId,
+        actorUserId: req.user!.id,
+        actorEmail: req.user!.email,
+        target: orgId,
+        metadata: { requireMfa, previous },
+        ip: clientIp(req),
+      });
+
+      return res.status(200).json({
+        requireMfa,
+        // Existing sessions are not revoked. Said plainly rather than left to be
+        // discovered: a token issued before the change keeps working for up to
+        // its 24 hours, and the policy binds at the next sign-in or switch.
+        note: "Applies at each member's next sign-in. Sessions already issued are unaffected.",
+      });
+    } catch (error) {
+      if (error instanceof OrganizationClosed) {
+        return res.status(410).json({ error: "This workspace has been closed" });
+      }
+      console.error("MFA policy error:", error);
+      return res.status(500).json({ error: "Failed to update the MFA policy" });
+    }
+  }
+);
+
+/**
+ * 9. Set how long this workspace's scans are kept
  *
  * Retention is a contract term, negotiated per customer, so it cannot live only
  * in the deployment's environment. Null restores the platform default rather
@@ -632,7 +716,7 @@ router.put(
 );
 
 /**
- * 9. Close the active workspace
+ * 10. Close the active workspace
  *
  * DELETE, because that is what the caller means and what the client will call
  * it - but the row is not deleted and cannot be. Jobs and ledger entries
@@ -684,7 +768,7 @@ router.delete(
 );
 
 /**
- * 10. Reopen a workspace closed by mistake
+ * 11. Reopen a workspace closed by mistake
  *
  * Only reachable with a token minted before the closure, since a closed
  * organization no longer appears in membershipsOf and no new token can name it.

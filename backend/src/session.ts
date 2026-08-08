@@ -30,13 +30,44 @@ export type Role = "ORG_ADMIN" | "MEMBER";
 export function issueSessionToken(
   user: { id: string; email: string },
   orgId: string,
-  role: Role
+  role: Role,
+  restricted = false
 ): string {
   return jwt.sign(
-    { id: user.id, email: user.email, organizationId: orgId, role },
+    {
+      id: user.id,
+      email: user.email,
+      organizationId: orgId,
+      role,
+      // Omitted rather than set false, so an ordinary session carries no claim
+      // at all and cannot be turned into a restricted one by flipping a bit
+      // that was already there.
+      ...(restricted ? { restricted: true } : {}),
+    },
     JWT_SECRET,
     { expiresIn: "24h" }
   );
+}
+
+/**
+ * Whether this person may act in this organization, or only enrol.
+ *
+ * A restricted session is the answer to a chicken-and-egg problem: an
+ * organization that turns on the requirement has members who cannot enrol
+ * without a session and cannot have a session without enrolling. Refusing the
+ * sign-in outright would strand them.
+ */
+export async function isRestricted(
+  user: { mfaEnabledAt?: Date | null },
+  organizationId: string
+): Promise<boolean> {
+  if (user.mfaEnabledAt) return false;
+
+  const org = await systemDb.query.organizations.findFirst({
+    where: eq(organizations.id, organizationId),
+  });
+
+  return !!org?.requireMfa;
 }
 
 /**
@@ -63,6 +94,8 @@ export async function membershipsOf(userId: string) {
 export interface SignInResult {
   token: string;
   memberships: Awaited<ReturnType<typeof membershipsOf>>;
+  /** True when the session may only reach MFA enrolment. */
+  mfaEnrolmentRequired?: boolean;
 }
 
 /** Raised when an authenticated person has nowhere to act. */
@@ -81,7 +114,7 @@ export class NoMemberships extends Error {
  * say whether MFA was in force at the time.
  */
 export async function completeSignIn(
-  user: { id: string; email: string },
+  user: { id: string; email: string; mfaEnabledAt?: Date | null },
   req: Request,
   factors: string[]
 ): Promise<SignInResult> {
@@ -92,6 +125,7 @@ export async function completeSignIn(
   }
 
   const active = list[0];
+  const restricted = await isRestricted(user, active.organizationId);
 
   await recordAuditEvent({
     action: AUDIT_ACTIONS.LOGIN_SUCCEEDED,
@@ -99,12 +133,13 @@ export async function completeSignIn(
     actorUserId: user.id,
     actorEmail: user.email,
     target: user.email,
-    metadata: { organizations: list.length, factors },
+    metadata: { organizations: list.length, factors, restricted },
     ip: clientIp(req),
   });
 
   return {
-    token: issueSessionToken(user, active.organizationId, active.role),
+    token: issueSessionToken(user, active.organizationId, active.role, restricted),
     memberships: list,
+    ...(restricted ? { mfaEnrolmentRequired: true } : {}),
   };
 }
