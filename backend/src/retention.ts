@@ -1,5 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
+import { inArray, sql } from "drizzle-orm";
+import { systemDb } from "./db";
+import { jobs } from "./db/schema";
 import { pruneJobEvents } from "./sse/bus";
 import { pruneWorkers, WORKER_FORGET_AFTER_HOURS } from "./observability/fleet";
 
@@ -30,8 +33,21 @@ import { pruneWorkers, WORKER_FORGET_AFTER_HOURS } from "./observability/fleet";
  *       }]
  *     }'
  *
- * Per-tenant retention (a hospital contract requiring 7 days rather than 30)
- * would need either a rule per prefix or object tagging - see AUDIT.md.
+ * Retention is per tenant. STORAGE_RETENTION_DAYS is the platform default, and
+ * organizations.retention_days overrides it for a customer whose contract says
+ * something else. The sweep is therefore driven from the database rather than
+ * from the filesystem: it asks which jobs have outlived *their own* tenant's
+ * window and deletes those files, instead of walking a directory and comparing
+ * every mtime against one global number.
+ *
+ * That ordering also fixes a subtler thing. A file's mtime is a proxy for the
+ * age of the scan; the job's created_at is the age of the scan. They differ
+ * whenever a file is rewritten, restored from a backup, or copied between
+ * hosts - and a restore that silently extends a contractual retention window is
+ * the wrong direction to be wrong in.
+ *
+ * On real S3 the per-tenant equivalent is a lifecycle rule per `org_id=` prefix
+ * or object tagging; the keys are already prefixed for it.
  */
 
 const RETENTION_DAYS = Number(process.env.STORAGE_RETENTION_DAYS || 30);
@@ -45,37 +61,91 @@ const EVENT_LOG_RETENTION_DAYS = Number(process.env.EVENT_LOG_RETENTION_DAYS || 
 
 const UPLOADS_DIR = path.join(__dirname, "../../uploads");
 
-/** Deletes stored images older than the retention window. Returns the count. */
-export async function sweepExpiredArtifacts(): Promise<number> {
+/** How many jobs are examined per sweep. Bounds one pass, not the backlog. */
+const SWEEP_BATCH = Number(process.env.RETENTION_SWEEP_BATCH || 500);
+
+export interface SweepResult {
+  /** Jobs whose window has passed and whose images are now gone. */
+  jobs: number;
+  /** Files actually unlinked. Lower than `jobs` when a file was already gone. */
+  files: number;
+}
+
+/**
+ * Deletes stored images for jobs that have outlived their tenant's window.
+ *
+ * The interval is computed in SQL against NOW(), so the comparison happens on
+ * one clock. Mixing the database's idea of created_at with the application's
+ * idea of "now" is how the queue-wait metric was silently negative for a while
+ * - the same mistake here would expire scans early or keep them past a
+ * contractual window, and nobody would notice either.
+ */
+export async function sweepExpiredArtifacts(): Promise<SweepResult> {
   if (RETENTION_DAYS <= 0) {
-    return 0; // Retention disabled.
+    return { jobs: 0, files: 0 }; // Platform retention disabled.
   }
 
-  if (!fs.existsSync(UPLOADS_DIR)) {
-    return 0;
+  // COALESCE, not a value copied into the row: a tenant that has never stated a
+  // preference tracks the deployment default, including when it changes.
+  //
+  // Deliberately no filter on organizations.deleted_at. A closed workspace's
+  // scans still expire on schedule - closure is not a reason to keep images
+  // longer, and it is the case where nobody is watching.
+  const due = await systemDb.execute(sql`
+    SELECT j.id
+      FROM jobs j
+      JOIN organizations o ON o.id = j.organization_id
+     WHERE j.artifacts_purged_at IS NULL
+       AND j.created_at < NOW() - (COALESCE(o.retention_days, ${RETENTION_DAYS}) || ' days')::interval
+     ORDER BY j.created_at ASC
+     LIMIT ${SWEEP_BATCH}
+  `);
+
+  if (due.rows.length === 0) {
+    return { jobs: 0, files: 0 };
   }
 
-  const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  let removed = 0;
+  let files = 0;
+  const purged: string[] = [];
 
-  for (const entry of await fs.promises.readdir(UPLOADS_DIR)) {
-    const filePath = path.join(UPLOADS_DIR, entry);
-    try {
-      const stat = await fs.promises.stat(filePath);
-      if (stat.isFile() && stat.mtimeMs < cutoff) {
+  for (const row of due.rows as { id: string }[]) {
+    let failed = false;
+
+    for (const kind of ["raw", "mask"]) {
+      const filePath = path.join(UPLOADS_DIR, `${row.id}-${kind}.png`);
+      try {
         await fs.promises.unlink(filePath);
-        removed++;
+        files++;
+      } catch (err: any) {
+        // Already gone is the expected case for a mask that was never produced,
+        // and for a re-sweep after a crash between unlink and the update below.
+        if (err?.code !== "ENOENT") {
+          console.error(`[Retention] Could not delete ${filePath}:`, err);
+          failed = true;
+        }
       }
-    } catch (err) {
-      console.error(`[Retention] Could not process ${entry}:`, err);
+    }
+
+    // Marked only when the bytes are actually gone. Recording a purge that did
+    // not happen would retire the job from the working set while its images sit
+    // on disk past the window the tenant was promised - the one failure of this
+    // sweeper that a customer could hold against the contract.
+    if (!failed) {
+      purged.push(row.id);
     }
   }
 
-  if (removed > 0) {
-    console.log(`[Retention] Deleted ${removed} artifact(s) older than ${RETENTION_DAYS} days.`);
+  if (purged.length > 0) {
+    await systemDb
+      .update(jobs)
+      .set({ artifactsPurgedAt: sql`NOW()` })
+      .where(inArray(jobs.id, purged));
+    console.log(
+      `[Retention] Purged images for ${purged.length} job(s) (${files} file(s)) past their tenant's window.`
+    );
   }
 
-  return removed;
+  return { jobs: purged.length, files };
 }
 
 /** Artifacts, the SSE event log, and records of workers that are gone. */
@@ -104,8 +174,9 @@ export function startRetentionSweeper() {
   }
 
   console.log(
-    `Retention sweeper started: delete stored images after ${RETENTION_DAYS} days, ` +
-    `prune events after ${EVENT_LOG_RETENTION_DAYS} days, sweeping every ${SWEEP_INTERVAL_HOURS}h`
+    `Retention sweeper started: delete stored images after ${RETENTION_DAYS} days ` +
+    `(or the tenant's own retention_days), prune events after ${EVENT_LOG_RETENTION_DAYS} days, ` +
+    `sweeping every ${SWEEP_INTERVAL_HOURS}h`
   );
 
   sweep().catch((err) => console.error("[Retention] Sweep failed:", err));

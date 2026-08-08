@@ -28,6 +28,11 @@ export const organizations = pgTable("organizations", {
   // history - and every tenant has history from its trial grant onward. See
   // migration 0011.
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  // How long this tenant's scans are kept. NULL means the platform default
+  // (STORAGE_RETENTION_DAYS) rather than "forever", so a tenant with no stated
+  // preference tracks the deployment's policy instead of freezing today's
+  // number into their row. See migration 0012.
+  retentionDays: integer("retention_days"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -109,6 +114,10 @@ export const jobs = pgTable("jobs", {
   // created_at, so a long queue wait is not mistaken for a stalled worker.
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
+  // When the stored images were removed by the retention sweeper. Distinct from
+  // "the file is missing": expired on schedule, never uploaded, and lost are
+  // three different answers, and only this column can tell them apart (0012).
+  artifactsPurgedAt: timestamp("artifacts_purged_at", { withTimezone: true }),
   // Set by the one caller whose trigger won. Makes dispatch single-shot: two
   // concurrent triggers cannot both publish the job. See migration 0009.
   dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),

@@ -16,11 +16,16 @@
  * Requires the API to be running.
  *   npx tsx src/test-retention.ts
  */
+import * as fs from "fs";
+import * as path from "path";
 import { sql } from "drizzle-orm";
 import { adminDb, systemDb, pool, authPool, adminPool } from "./db";
 import { verifyAuditChain } from "./audit";
+import { sweepExpiredArtifacts } from "./retention";
 
 const API = "http://localhost:3000/api";
+const UPLOADS_DIR = path.join(__dirname, "../../uploads");
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function assert(condition: boolean, message: string) {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -39,8 +44,24 @@ async function call(method: string, pathname: string, body?: unknown, token?: st
 }
 
 const post = (p: string, b?: unknown, t?: string) => call("POST", p, b, t);
+const put = (p: string, b?: unknown, t?: string) => call("PUT", p, b, t);
 const get = (p: string, t?: string) => call("GET", p, undefined, t);
 const del = (p: string, t?: string) => call("DELETE", p, undefined, t);
+
+/** Reserves a job and uploads a scan, so there are bytes on disk to expire. */
+async function uploadedJob(token: string): Promise<string> {
+  const requested = await post("/jobs/request", {}, token);
+  if (requested.status !== 200) throw new Error(`job request failed: ${JSON.stringify(requested.body)}`);
+
+  const upload = await fetch(requested.body.uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "image/png" },
+    body: PNG,
+  });
+  if (!upload.ok) throw new Error(`upload failed: HTTP ${upload.status}`);
+
+  return requested.body.jobId as string;
+}
 
 async function register(email: string, orgName: string, password = "correct-horse-battery-1") {
   const r = await post("/auth/register", { email, password, orgName });
@@ -219,7 +240,79 @@ async function run() {
   console.log(`-> wrong password on a deactivated account: HTTP ${wrongPassword.status}`);
   assert(wrongPassword.status === 401, "deactivation is disclosed before the password is checked");
 
-  console.log("\n11. The audit chain still verifies across all of it");
+  console.log("\n11. The retention window is a per-tenant setting, and it is bounded");
+  const tooShort = await put("/auth/organization/retention", { retentionDays: 0 }, admin.token);
+  const tooLong = await put("/auth/organization/retention", { retentionDays: 4000 }, admin.token);
+  const fractional = await put("/auth/organization/retention", { retentionDays: 7.5 }, admin.token);
+  const accepted = await put("/auth/organization/retention", { retentionDays: 7 }, admin.token);
+  console.log(
+    `-> 0 days: ${tooShort.status}, 4000 days: ${tooLong.status}, ` +
+      `7.5 days: ${fractional.status}, 7 days: ${accepted.status}`
+  );
+  // Zero would mean "delete immediately" here and "retention disabled" in the
+  // platform setting - opposites, so it is refused rather than guessed at.
+  assert(tooShort.status === 400, "zero days was accepted");
+  assert(tooLong.status === 400, "a ten-year window was accepted");
+  assert(fractional.status === 400, "a fractional number of days was accepted");
+  assert(accepted.status === 200 && accepted.body.retentionDays === 7, "a valid window was refused");
+
+  console.log("\n12. The sweeper honours the tenant's window, not the platform default");
+  // Two jobs of the same age in different tenants: one whose customer agreed to
+  // seven days, one on the platform's thirty. Only the first should expire.
+  const shortJob = await uploadedJob(admin.token);
+  const other = await register(`ret.other.${stamp}@other-${stamp}.example.org`, `Other Hospital ${stamp}`);
+  const defaultJob = await uploadedJob(other.token);
+
+  const shortRaw = path.join(UPLOADS_DIR, `${shortJob}-raw.png`);
+  const defaultRaw = path.join(UPLOADS_DIR, `${defaultJob}-raw.png`);
+  assert(fs.existsSync(shortRaw) && fs.existsSync(defaultRaw), "the uploaded scans were not stored");
+
+  // Aged in the database rather than by touching mtimes: created_at is the age
+  // of the scan, and it is what the sweeper is required to measure.
+  await adminDb.execute(
+    sql`UPDATE jobs SET created_at = NOW() - INTERVAL '10 days' WHERE id IN (${shortJob}, ${defaultJob})`
+  );
+
+  const swept = await sweepExpiredArtifacts();
+  console.log(`-> swept ${swept.jobs} job(s), ${swept.files} file(s)`);
+  console.log(`-> 7-day tenant's scan on disk: ${fs.existsSync(shortRaw)}, 30-day tenant's: ${fs.existsSync(defaultRaw)}`);
+  assert(!fs.existsSync(shortRaw), "a scan past the tenant's seven-day window was kept");
+  assert(fs.existsSync(defaultRaw), "a scan inside the platform's default window was deleted");
+
+  const purgeMark = await adminDb.execute(
+    sql`SELECT id, artifacts_purged_at FROM jobs WHERE id IN (${shortJob}, ${defaultJob})`
+  );
+  const marks = new Map((purgeMark.rows as any[]).map((r) => [r.id, r.artifacts_purged_at]));
+  assert(marks.get(shortJob) !== null, "the purge was not recorded on the job");
+  assert(marks.get(defaultJob) === null, "a job inside its window was marked purged");
+
+  // Re-sweeping must not re-report work it already did, or the sweep never
+  // stops growing and the log stops meaning anything.
+  const again2 = await sweepExpiredArtifacts();
+  console.log(`-> second sweep: ${again2.jobs} job(s)`);
+  assert(again2.jobs === 0, "the sweeper re-processed a job it had already purged");
+
+  console.log("\n13. An expired scan says so, rather than looking lost");
+  const gone = await get(`/jobs/${shortJob}/image/raw`, admin.token);
+  const stillThere = await get(`/jobs/${defaultJob}/image/raw`, other.token);
+  console.log(`-> expired: HTTP ${gone.status}, within window: HTTP ${stillThere.status}`);
+  assert(gone.status === 410, `an expired scan answered ${gone.status} rather than 410`);
+  assert(!!gone.body?.purgedAt, "the expiry response does not say when the images were deleted");
+  assert(stillThere.status === 200, "a scan inside its window was not served");
+
+  console.log("\n14. Changing retention is audited, with the value it replaced");
+  await put("/auth/organization/retention", { retentionDays: null }, admin.token);
+  let change: any = null;
+  for (let attempt = 0; attempt < 10 && !change; attempt++) {
+    await new Promise((r) => setTimeout(r, 200));
+    const trail = await get("/audit?action=organization.retention.changed&limit=10", admin.token);
+    change = (trail.body?.events as any[])?.find((e: any) => e.metadata?.previous === 7);
+  }
+  console.log(`-> ${change?.actorEmail} changed retention from ${change?.metadata?.previous} to ${change?.metadata?.retentionDays}`);
+  assert(!!change, "a retention change was not recorded");
+  assert(change.metadata.retentionDays === null, "the new value was not recorded");
+
+  console.log("\n15. The audit chain still verifies across all of it");
   const chain = await verifyAuditChain();
   console.log(`-> ${chain.checked} event(s) checked, ok: ${chain.ok}`);
   assert(chain.ok, `the audit chain broke at row ${chain.brokenAt}: ${chain.reason}`);
@@ -230,9 +323,10 @@ async function run() {
     sql`UPDATE organizations SET deleted_at = NOW() WHERE id = ${admin.orgId} AND deleted_at IS NULL`
   );
 
-  console.log("\n=== RETENTION OF RECORD VERIFIED ===");
+  console.log("\n=== RETENTION VERIFIED ===");
   console.log("Organizations, users, jobs, and invites cannot be deleted out from under");
   console.log("the record. Closure stops the tenant acting and keeps everything else.");
+  console.log("Scan images expire on their own tenant's window, and say so when they have.");
 }
 
 run()

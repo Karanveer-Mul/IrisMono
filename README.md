@@ -126,7 +126,7 @@ npm run test:identity    # one account across organizations, role per membership
 npm run test:sse         # cross-instance delivery and Last-Event-ID replay
 npm run test:observability  # probes, metrics, fleet visibility, correlation ids
 npm run test:security    # audit chain, invite caps, encryption at rest, lockout
-npm run test:retention   # deletes refused as superuser, workspace closure, deactivation
+npm run test:retention   # deletes refused as superuser, closure, per-tenant expiry
 ```
 
 `test:sse` needs a **second API instance**, because a single-process test cannot distinguish a working bus from the in-process hub it replaced:
@@ -166,7 +166,8 @@ cd frontend && npx tsc --noEmit
 | `WORKER_HEALTH_PORT` | `9101` | Where a worker answers probes and scrapes. Give each worker on a shared host its own port; `0` disables the listener. |
 | `WORKER_STALE_AFTER_SECONDS` | `45` | When the API stops counting a worker as online. Set independently of the worker's own heartbeat interval, because the API cannot know how a given worker was configured. |
 | `SHUTDOWN_DRAIN_MS` | `0` | How long to keep serving after SIGTERM. Zero suits local development; see Operations for what a deployment needs. |
-| `STORAGE_RETENTION_DAYS` | `30` | Deletes stored images. Job metadata is kept indefinitely for billing and audit. On real S3, use a bucket lifecycle rule instead — see `src/retention.ts`. |
+| `STORAGE_RETENTION_DAYS` | `30` | Platform default for deleting stored images, overridden per tenant by `organizations.retention_days` (`PUT /api/auth/organization/retention`). Job metadata is kept indefinitely for billing and audit. On real S3, use a bucket lifecycle rule per `org_id=` prefix instead — see `src/retention.ts`. |
+| `RETENTION_SWEEP_BATCH` | `500` | Jobs examined per sweep. Bounds one pass, not the backlog. |
 
 **Wiring a real bucket.** Point `AWS_S3_ENDPOINT` at S3, MinIO, or LocalStack, then configure the bucket to notify the API on upload — that notification is what queues the job:
 
@@ -195,6 +196,7 @@ Storage and the ML model are both mocked for local development. Images go to `./
 - **Invite links expire and run out.** Default 25 uses and 30 days when unspecified, enforced by a `CHECK` constraint as well as by the handler, and `memberships.invite_id` records which link admitted whom.
 - **Sign-ins are throttled.** Five failures lock an account for 15 minutes, counted in the database so the limit does not divide by the number of API instances. Passwords are length-first: 12 characters minimum.
 - **The record cannot be deleted out from under itself.** Jobs, ledger entries, and the invites that admitted people reference their parents with `ON DELETE RESTRICT`, so deleting an organization or a user is refused rather than cascaded — including for a superuser at a `psql` prompt. Removing a customer is closure (`DELETE /api/auth/organization`, ORG_ADMIN), which stops the tenant acting and keeps everything else. Closure is not erasure: a tenant asking for their data to be destroyed is served by destroying their data key, which leaves the billing and audit metadata that must be retained. There is deliberately no button for closure in the dashboard — it is an API call, and an irreversible-looking one next to the upload form invites the accident it is hard to undo.
+- **Retention is per tenant.** `STORAGE_RETENTION_DAYS` is the platform default; a customer whose contract says seven days sets `retention_days` on their organization and the sweeper honours it. Only image bytes expire — job metadata stays for billing and audit — and an expired scan answers `410` with the date it was purged rather than a bare `404`, because "deleted on schedule" and "missing" are different answers.
 
 Generate a master key with:
 

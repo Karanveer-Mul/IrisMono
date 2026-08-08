@@ -9,7 +9,12 @@ import * as bcrypt from "bcryptjs";
 import * as jwt from "jsonwebtoken";
 import { isEmailDomainAllowed, getEmailDomain } from "../utils/domain";
 import { authenticateJWT, AuthenticatedRequest, issueStreamToken, requireRole } from "../middleware/auth";
-import { closeOrganization, reopenOrganization } from "../lifecycle";
+import {
+  assertOrganizationActive,
+  closeOrganization,
+  OrganizationClosed,
+  reopenOrganization,
+} from "../lifecycle";
 import { grantCredits } from "../credits";
 import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
 import { checkPasswordStrength, clearFailedLogins, registerFailedLogin } from "../passwords";
@@ -590,7 +595,80 @@ router.post("/stream-token", authenticateJWT, (req: AuthenticatedRequest, res: R
 });
 
 /**
- * 8. Close the active workspace
+ * 8. Set how long this workspace's scans are kept
+ *
+ * Retention is a contract term, negotiated per customer, so it cannot live only
+ * in the deployment's environment. Null restores the platform default rather
+ * than meaning "keep forever" - a tenant withdrawing a preference should track
+ * the deployment's policy, not opt out of retention entirely.
+ *
+ * Changes are audited both ways. Shortening a window destroys data on a
+ * schedule and lengthening one keeps images past what a hospital may have told
+ * its patients, so "who changed this, when, from what" has to be answerable.
+ */
+router.put(
+  "/organization/retention",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+    const { retentionDays } = req.body ?? {};
+
+    const requested =
+      retentionDays === null || retentionDays === undefined ? null : Number(retentionDays);
+
+    if (requested !== null && (!Number.isInteger(requested) || requested < 1 || requested > 3650)) {
+      return res.status(400).json({
+        error: "retentionDays must be a whole number of days between 1 and 3650, or null for the platform default",
+      });
+    }
+
+    try {
+      const previous = await withTenant(orgId, async (tx) => {
+        await assertOrganizationActive(tx, orgId);
+
+        // Read before write, in the same transaction. RETURNING on an UPDATE
+        // yields the new row, so it cannot tell us what the value used to be.
+        const current = await tx.query.organizations.findFirst({
+          where: eq(organizations.id, orgId),
+        });
+
+        await tx
+          .update(organizations)
+          .set({ retentionDays: requested, updatedAt: new Date() })
+          .where(eq(organizations.id, orgId));
+
+        return current?.retentionDays ?? null;
+      });
+
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.RETENTION_CHANGED,
+        organizationId: orgId,
+        actorUserId: req.user!.id,
+        actorEmail: req.user!.email,
+        target: orgId,
+        // The old value matters as much as the new one: a shortened window is
+        // an instruction to delete, and the trail has to show what it replaced.
+        metadata: { retentionDays: requested, previous },
+        ip: clientIp(req),
+      });
+
+      return res.status(200).json({
+        retentionDays: requested,
+        usingPlatformDefault: requested === null,
+      });
+    } catch (error) {
+      if (error instanceof OrganizationClosed) {
+        return res.status(410).json({ error: "This workspace has been closed" });
+      }
+      console.error("Retention update error:", error);
+      return res.status(500).json({ error: "Failed to update retention policy" });
+    }
+  }
+);
+
+/**
+ * 9. Close the active workspace
  *
  * DELETE, because that is what the caller means and what the client will call
  * it - but the row is not deleted and cannot be. Jobs and ledger entries
@@ -642,7 +720,7 @@ router.delete(
 );
 
 /**
- * 9. Reopen a workspace closed by mistake
+ * 10. Reopen a workspace closed by mistake
  *
  * Only reachable with a token minted before the closure, since a closed
  * organization no longer appears in membershipsOf and no new token can name it.

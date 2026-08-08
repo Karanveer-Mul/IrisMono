@@ -800,6 +800,17 @@ router.get("/:jobId/image/:kind", async (req: AuthenticatedRequest, res: Respons
       return res.status(404).json({ error: "Job record not found." });
     }
 
+    // Answered before the file is looked for, because "expired on schedule" and
+    // "missing" are different facts and only one of them is an incident. A
+    // clinician told 404 for a scan that was deleted exactly as contracted has
+    // been given the wrong answer, and so has the engineer they escalate to.
+    if (job.artifactsPurgedAt) {
+      return res.status(410).json({
+        error: "This scan has passed its retention window and its images were deleted.",
+        purgedAt: job.artifactsPurgedAt.toISOString(),
+      });
+    }
+
     // jobId comes from a UUID-keyed lookup that just succeeded, so it cannot
     // contain traversal characters by the time we build the path.
     const filePath = path.join(UPLOADS_DIR, `${job.id}-${kind}.png`);
