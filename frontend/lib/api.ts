@@ -7,6 +7,16 @@ export interface UserContext {
   organizationId: string;
   /** Role in that organization - a person may hold a different one elsewhere. */
   role: "ORG_ADMIN" | "MEMBER";
+  /**
+   * Set when the active organization requires a second factor and this account
+   * does not have one. The session is real but reaches only MFA enrolment, so
+   * the shell renders the enrolment gate instead of the dashboard.
+   *
+   * Read from the token rather than from the sign-in response, so a reload of
+   * a restricted session lands in the same place instead of on a dashboard
+   * whose every request will be refused.
+   */
+  restricted?: boolean;
 }
 
 export interface Membership {
@@ -57,6 +67,7 @@ export function decodeUserFromToken(token: string | null): UserContext | null {
       email: payload.email,
       organizationId: payload.organizationId,
       role: payload.role,
+      restricted: payload.restricted === true,
     };
   } catch (err) {
     console.error("Failed to decode token payload:", err);

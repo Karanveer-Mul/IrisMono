@@ -28,8 +28,11 @@ app/
   page.tsx              /
   join/[code]/page.tsx  /join/inv_<uuid> — invite landing
 components/
-  AppShell.tsx          session gate: Auth or Dashboard
+  AppShell.tsx          session gate: Auth, forced MFA enrolment, or Dashboard
   Auth.tsx              sign in / create workspace / join team
+  MfaChallenge.tsx      second step of a sign-in: code or recovery code
+  MfaEnrolment.tsx      two-step enrolment, then the recovery codes
+  SecurityPanel.tsx     MFA on/off, and the org-wide requirement (ORG_ADMIN)
   Dashboard.tsx         credits, job history, SSE subscription
   MaskUploader.tsx      drag-drop upload, job status, result preview
   InviteManager.tsx     domain whitelist + reusable invite links (ORG_ADMIN)
@@ -45,11 +48,15 @@ Notable changes from the Vite version:
 - **`apiFetch` serializes object bodies.** The old version passed plain objects straight to `fetch`, which stringified them to `[object Object]` — every POST from the UI was rejected by the backend's JSON parser. See `AUDIT.md`.
 - **Fonts come from `next/font`** rather than a Google Fonts `<link>` in `index.html`.
 
-## Two things worth knowing
+## Three things worth knowing
 
 **Live updates use a separate token.** `EventSource` cannot set an `Authorization` header, so `Dashboard.tsx` first calls `POST /api/auth/stream-token` for a 60-second token and passes it to the stream as `?token=`. That token is scoped to the stream — the API refuses it as a Bearer credential.
 
 **Job images are fetched as blobs.** `GET /api/jobs/:jobId/image/:kind` is tenant-scoped behind the normal session, which an `<img src>` cannot satisfy, so `JobImage.tsx` fetches the bytes with the token attached and renders an object URL.
+
+**A restricted session is gated in the shell, not the dashboard.** When an organization requires MFA and the account has no second factor, the sign-in succeeds but the token carries `restricted` and reaches only enrolment. `AppShell` reads that claim from the token — not from the sign-in response — so reloading the page lands on enrolment rather than on a dashboard whose every request will be refused. Finishing enrolment drops the token and returns to sign-in, because the claim was baked in when the token was issued and only a fresh sign-in re-evaluates it.
+
+There is no QR code. Rendering one needs either a dependency or a few hundred lines of encoder, and the manual-entry key every authenticator app accepts is the same secret — so the key is shown plainly, with the `otpauth://` URI beside it, rather than shipping a picture of it later.
 
 ## Running the whole stack
 

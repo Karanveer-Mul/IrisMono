@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiFetch, setToken, decodeUserFromToken } from "@/lib/api";
 import type { UserContext } from "@/lib/api";
+import { MfaChallenge } from "./MfaChallenge";
 import { Shield, Sparkles, Building2, UserPlus, KeyRound } from "lucide-react";
 
 type AuthTab = "login" | "register-org" | "join-invite";
@@ -27,6 +28,8 @@ export function Auth({ onAuthSuccess, initialInviteCode }: AuthProps) {
   const [inviteCode, setInviteCode] = useState(initialInviteCode ?? "");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  /** Set when the password step succeeded and a second factor is owed. */
+  const [pendingMfaToken, setPendingMfaToken] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -52,6 +55,15 @@ export function Auth({ onAuthSuccess, initialInviteCode }: AuthProps) {
         body: payload,
       });
 
+      // The password was right, but it is only the first factor for this
+      // account. Nothing is stored yet - what came back is a five-minute
+      // challenge token, not a session.
+      if (res.mfaRequired) {
+        setPendingMfaToken(res.mfaToken);
+        setLoading(false);
+        return;
+      }
+
       if (res.token) {
         setToken(res.token);
         const decodedUser = decodeUserFromToken(res.token);
@@ -71,6 +83,19 @@ export function Auth({ onAuthSuccess, initialInviteCode }: AuthProps) {
       setLoading(false);
     }
   };
+
+  if (pendingMfaToken) {
+    return (
+      <MfaChallenge
+        mfaToken={pendingMfaToken}
+        onVerified={onAuthSuccess}
+        onCancel={() => {
+          setPendingMfaToken(null);
+          setPassword("");
+        }}
+      />
+    );
+  }
 
   return (
     <div className="auth-wrapper">

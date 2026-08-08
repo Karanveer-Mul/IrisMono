@@ -5,6 +5,7 @@ import { apiFetch, removeToken, setToken, decodeUserFromToken } from "@/lib/api"
 import type { UserContext, Membership } from "@/lib/api";
 import { MaskUploader } from "./MaskUploader";
 import { InviteManager } from "./InviteManager";
+import { SecurityPanel } from "./SecurityPanel";
 import { LogOut, Coins, ShieldCheck, ClipboardList, Clock, Layers } from "lucide-react";
 
 interface OrganizationInfo {
@@ -12,6 +13,8 @@ interface OrganizationInfo {
   name: string;
   creditBalance: number;
   allowedDomains: string[];
+  /** Whether this workspace requires a second factor of its members. */
+  requireMfa?: boolean;
 }
 
 interface AuditLog {
@@ -422,6 +425,13 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
               </div>
             </div>
           </div>
+
+          {/* Second factor, and - for an admin - whether it is required here */}
+          <SecurityPanel
+            user={user}
+            requireMfa={!!org?.requireMfa}
+            onPolicyChanged={loadProfileAndLogs}
+          />
 
           {/* Invite whitelisting panel (Admin Only) */}
           {user.role === "ORG_ADMIN" ? (

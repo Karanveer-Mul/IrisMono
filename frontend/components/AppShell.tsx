@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { Auth } from "./Auth";
 import { Dashboard } from "./Dashboard";
+import { MfaEnrolment } from "./MfaEnrolment";
 import { getToken, removeToken, decodeUserFromToken } from "@/lib/api";
 import type { UserContext } from "@/lib/api";
 
@@ -36,6 +37,30 @@ export function AppShell({ initialInviteCode }: AppShellProps) {
     return (
       <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <div className="spinner" />
+      </div>
+    );
+  }
+
+  // A restricted session is a real sign-in that can reach nothing but MFA
+  // enrolment. Gating here rather than inside the dashboard: every request the
+  // dashboard makes on mount would be refused, so it would render a shell of
+  // empty panels and a stack of console errors instead of the one thing the
+  // person is able to do.
+  if (user?.restricted) {
+    return (
+      <div className="auth-wrapper">
+        <div className="auth-container">
+          <MfaEnrolment
+            required
+            onEnrolled={() => {
+              // Enrolling does not lift the restriction on the token that is
+              // already held - the claim was baked in when it was issued. A
+              // fresh sign-in is what re-evaluates it.
+              removeToken();
+              setUser(null);
+            }}
+          />
+        </div>
       </div>
     );
   }
