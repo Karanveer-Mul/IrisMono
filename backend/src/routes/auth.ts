@@ -28,6 +28,7 @@ import {
   reopenOrganization,
 } from "../lifecycle";
 import { grantCredits } from "../credits";
+import { PLATFORM_RETENTION_DAYS } from "../retention";
 import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
 import { checkPasswordStrength, clearFailedLogins, registerFailedLogin } from "../passwords";
 
@@ -474,6 +475,10 @@ router.get("/profile", authenticateJWT, async (req: AuthenticatedRequest, res: R
         role: req.user!.role,
       },
       organization: data.organization,
+      // What organizations.retention_days = NULL resolves to. Sent with the
+      // profile because a tenant on the default has no other way to learn how
+      // long their scans are actually kept.
+      platformRetentionDays: PLATFORM_RETENTION_DAYS,
       memberships: await membershipsOf(userId),
     });
   } catch (error) {

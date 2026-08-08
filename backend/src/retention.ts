@@ -51,6 +51,13 @@ import { pruneWorkers, WORKER_FORGET_AFTER_HOURS } from "./observability/fleet";
  */
 
 const RETENTION_DAYS = Number(process.env.STORAGE_RETENTION_DAYS || 30);
+
+/**
+ * Exported so the API can tell a tenant what "the platform default" actually
+ * means. An administrator choosing between their own window and the default is
+ * choosing blind unless the number is on screen.
+ */
+export const PLATFORM_RETENTION_DAYS = RETENTION_DAYS;
 const SWEEP_INTERVAL_HOURS = Number(process.env.RETENTION_SWEEP_INTERVAL_HOURS || 6);
 
 /**

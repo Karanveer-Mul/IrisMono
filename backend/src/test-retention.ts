@@ -312,7 +312,24 @@ async function run() {
   assert(!!change, "a retention change was not recorded");
   assert(change.metadata.retentionDays === null, "the new value was not recorded");
 
-  console.log("\n15. The audit chain still verifies across all of it");
+  console.log("\n15. The profile says what the platform default actually is");
+  // A tenant on the default has no other way to learn how long their scans are
+  // kept, and an administrator choosing between the two is choosing blind.
+  const onDefault = await get("/auth/profile", admin.token);
+  await put("/auth/organization/retention", { retentionDays: 14 }, admin.token);
+  const onOwn = await get("/auth/profile", admin.token);
+  console.log(
+    `-> default: ${onDefault.body.platformRetentionDays} days, ` +
+      `own window: ${onOwn.body.organization.retentionDays} days`
+  );
+  assert(
+    onDefault.body.platformRetentionDays === Number(process.env.STORAGE_RETENTION_DAYS || 30),
+    "the profile does not name the platform's retention window"
+  );
+  assert(onDefault.body.organization.retentionDays === null, "a cleared window did not read back as null");
+  assert(onOwn.body.organization.retentionDays === 14, "the tenant's own window is not in the profile");
+
+  console.log("\n16. The audit chain still verifies across all of it");
   const chain = await verifyAuditChain();
   console.log(`-> ${chain.checked} event(s) checked, ok: ${chain.ok}`);
   assert(chain.ok, `the audit chain broke at row ${chain.brokenAt}: ${chain.reason}`);

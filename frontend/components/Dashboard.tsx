@@ -6,6 +6,7 @@ import type { UserContext, Membership } from "@/lib/api";
 import { MaskUploader } from "./MaskUploader";
 import { InviteManager } from "./InviteManager";
 import { SecurityPanel } from "./SecurityPanel";
+import { WorkspacePanel } from "./WorkspacePanel";
 import { LogOut, Coins, ShieldCheck, ClipboardList, Clock, Layers } from "lucide-react";
 
 interface OrganizationInfo {
@@ -15,6 +16,10 @@ interface OrganizationInfo {
   allowedDomains: string[];
   /** Whether this workspace requires a second factor of its members. */
   requireMfa?: boolean;
+  /** How long scans are kept here; null means the platform default. */
+  retentionDays?: number | null;
+  /** Set once the workspace has been closed. The row survives; access does not. */
+  deletedAt?: string | null;
 }
 
 interface AuditLog {
@@ -39,6 +44,9 @@ interface DashboardProps {
 export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardProps) {
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [org, setOrg] = useState<OrganizationInfo | null>(null);
+  // What a null retentionDays resolves to on this deployment, so the panel can
+  // name the number rather than the word "default".
+  const [platformRetentionDays, setPlatformRetentionDays] = useState<number | null>(null);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [activeJob, setActiveJob] = useState<AuditLog | null>(null);
   const [glowCredits, setGlowCredits] = useState(false);
@@ -62,6 +70,7 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
 
       // Trigger glow animation if balance changed (spend or refund)
       setMemberships(profile.memberships || []);
+      setPlatformRetentionDays(profile.platformRetentionDays ?? null);
 
       setOrg((prev) => {
         if (prev && prev.creditBalance !== profile.organization.creditBalance) {
@@ -296,6 +305,18 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
         </div>
       </header>
 
+      {/* A closed workspace still renders, because the administrator who closed
+          it is the only person who can reopen it - but nothing else here will
+          work, and saying so beats letting every action fail with a 410. */}
+      {org?.deletedAt && (
+        <div className="callout callout-error" style={{ margin: "0 2rem 1rem" }}>
+          <div style={{ fontSize: "0.85rem" }}>
+            This workspace is closed. Existing records are kept, but no new scans can be submitted
+            and nobody else can sign in to it.
+          </div>
+        </div>
+      )}
+
       {/* Main Grid Content */}
       <main className="grid-container" style={{ flex: 1 }}>
 
@@ -432,6 +453,15 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
             requireMfa={!!org?.requireMfa}
             onPolicyChanged={loadProfileAndLogs}
           />
+
+          {/* Retention and closure. Admin only, like the API behind it. */}
+          {user.role === "ORG_ADMIN" && org && (
+            <WorkspacePanel
+              org={org}
+              platformRetentionDays={platformRetentionDays}
+              onChanged={loadProfileAndLogs}
+            />
+          )}
 
           {/* Invite whitelisting panel (Admin Only) */}
           {user.role === "ORG_ADMIN" ? (

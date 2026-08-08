@@ -33,6 +33,7 @@ components/
   MfaChallenge.tsx      second step of a sign-in: code or recovery code
   MfaEnrolment.tsx      two-step enrolment, then the recovery codes
   SecurityPanel.tsx     MFA on/off, and the org-wide requirement (ORG_ADMIN)
+  WorkspacePanel.tsx    retention window, workspace closure and reopening (ORG_ADMIN)
   Dashboard.tsx         credits, job history, SSE subscription
   MaskUploader.tsx      drag-drop upload, job status, result preview
   InviteManager.tsx     domain whitelist + reusable invite links (ORG_ADMIN)
@@ -55,6 +56,10 @@ Notable changes from the Vite version:
 **Job images are fetched as blobs.** `GET /api/jobs/:jobId/image/:kind` is tenant-scoped behind the normal session, which an `<img src>` cannot satisfy, so `JobImage.tsx` fetches the bytes with the token attached and renders an object URL.
 
 **A restricted session is gated in the shell, not the dashboard.** When an organization requires MFA and the account has no second factor, the sign-in succeeds but the token carries `restricted` and reaches only enrolment. `AppShell` reads that claim from the token — not from the sign-in response — so reloading the page lands on enrolment rather than on a dashboard whose every request will be refused. Finishing enrolment drops the token and returns to sign-in, because the claim was baked in when the token was issued and only a fresh sign-in re-evaluates it.
+
+**A closed workspace still renders the dashboard.** Closure sets `deleted_at`; the rows survive and so does the session that closed it, which is the only session that can reopen it — no new token can name a closed workspace. So the dashboard stays up behind a banner rather than throwing the administrator out, and `WorkspacePanel` says on screen that signing out ends the ability to undo. Closing asks for the workspace name to be typed, because the cost of the accident is every member losing access at once.
+
+The retention control shows the platform's own window when a tenant has not set one, which is why `GET /api/auth/profile` returns `platformRetentionDays` next to the organization — a choice between "14" and the word "default" is not a choice an administrator can make.
 
 There is no QR code. Rendering one needs either a dependency or a few hundred lines of encoder, and the manual-entry key every authenticator app accepts is the same secret — so the key is shown plainly, with the `otpauth://` URI beside it, rather than shipping a picture of it later.
 
