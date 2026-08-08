@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, integer, text, boolean, timestamp, pgEnum, doublePrecision, bigserial, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, uuid, varchar, integer, text, boolean, timestamp, pgEnum, doublePrecision, bigint, bigserial, char, jsonb } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 
 // Custom enums
@@ -50,6 +50,14 @@ export const users = pgTable("users", {
   failedLoginCount: integer("failed_login_count").notNull().default(0),
   lockedUntil: timestamp("locked_until", { withTimezone: true }),
   lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+  // Second factor. The secret is wrapped by the master key, never stored in the
+  // clear; mfaEnabledAt stays null until the user proves they can produce a
+  // code from it, so a half-finished enrolment cannot lock them out. See 0013.
+  mfaSecret: text("mfa_secret"),
+  mfaEnabledAt: timestamp("mfa_enabled_at", { withTimezone: true }),
+  // Last TOTP step accepted, so a code observed in its 30-second window cannot
+  // be replayed for the rest of it.
+  mfaLastStep: bigint("mfa_last_step", { mode: "number" }),
   // As with organizations: a person who has run a single job cannot be deleted,
   // because that job is a clinical record and the account is its provenance.
   // Deactivation is what "remove this user" means here.
@@ -170,6 +178,18 @@ export const workerHeartbeats = pgTable("worker_heartbeats", {
   jobsFailed: integer("jobs_failed").notNull().default(0),
   startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
   lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// 7b. Recovery codes
+//
+// Single-use, and kept after use: "this account was recovered with a code on
+// the 4th" is what an investigation needs, and a deleted row cannot say it.
+export const userRecoveryCodes = pgTable("user_recovery_codes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  codeHash: char("code_hash", { length: 64 }).notNull(),
+  usedAt: timestamp("used_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 // 8. Audit log

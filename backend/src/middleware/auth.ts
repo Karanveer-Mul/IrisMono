@@ -24,12 +24,18 @@ export interface AuthenticatedRequest extends Request {
 }
 
 /**
- * Session tokens carry no purpose claim; stream tokens carry purpose "stream".
- * They are deliberately not interchangeable - see authenticateJWT below.
+ * Session tokens carry no purpose claim. Every other kind carries one, and none
+ * of them are interchangeable with a session - see authenticateJWT below.
+ *
+ *   stream  60 seconds, rides in a query string, for the SSE endpoint.
+ *   mfa     5 minutes, proves the password step only, for the MFA challenge.
  */
 interface SessionClaims extends AuthUser {
-  purpose?: "stream";
+  purpose?: "stream" | "mfa";
 }
+
+/** Lifetime of an MFA challenge token. Long enough to open an app, no longer. */
+const MFA_TOKEN_TTL_SECONDS = 300;
 
 export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
@@ -43,11 +49,15 @@ export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: 
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as SessionClaims;
 
-    // A stream token leaks more easily than a session token (it rides in a
-    // query string, so it lands in access logs and Referer headers). Refuse
-    // to accept one as a general-purpose credential.
-    if (decoded.purpose === "stream") {
-      return res.status(403).json({ error: "Stream tokens cannot be used for API access" });
+    // Anything with a purpose is a narrow credential and is refused here, by
+    // default rather than by enumeration. A stream token leaks easily (it rides
+    // in a query string, so it lands in access logs and Referer headers); an
+    // MFA challenge token represents a half-finished sign-in, and accepting it
+    // as a session would make the second factor optional for anyone who noticed.
+    if (decoded.purpose) {
+      return res.status(403).json({
+        error: `Tokens issued for ${decoded.purpose} cannot be used for API access`,
+      });
     }
 
     req.user = decoded;
@@ -76,6 +86,36 @@ export function issueStreamToken(user: AuthUser): string {
     JWT_SECRET,
     { expiresIn: STREAM_TOKEN_TTL_SECONDS }
   );
+}
+
+/**
+ * Mints the token that carries a half-finished sign-in.
+ *
+ * Issued once the password is verified and before the second factor is. It
+ * names the user and nothing else useful: no organization, no role, and it is
+ * refused by every authenticated route, so the only thing it can do is be
+ * exchanged for a session at POST /api/auth/mfa/verify.
+ */
+export function issueMfaChallengeToken(user: { id: string; email: string }): string {
+  return jwt.sign({ id: user.id, email: user.email, purpose: "mfa" }, JWT_SECRET, {
+    expiresIn: MFA_TOKEN_TTL_SECONDS,
+  });
+}
+
+export interface MfaChallenge {
+  id: string;
+  email: string;
+}
+
+/** Verifies a challenge token. Returns null for anything else. */
+export function readMfaChallengeToken(token: string): MfaChallenge | null {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as SessionClaims;
+    if (decoded.purpose !== "mfa") return null;
+    return { id: decoded.id, email: decoded.email };
+  } catch {
+    return null;
+  }
 }
 
 /**

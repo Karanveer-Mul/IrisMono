@@ -4,11 +4,17 @@ import { Router, Request, Response } from "express";
 // RLS-bypassing system identity. Everything with a known tenant uses withTenant.
 import { systemDb, withTenant } from "../db";
 import { organizations, users, memberships, organizationInvites } from "../db/schema";
-import { eq, and, isNull, sql } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import * as bcrypt from "bcryptjs";
-import * as jwt from "jsonwebtoken";
 import { isEmailDomainAllowed, getEmailDomain } from "../utils/domain";
-import { authenticateJWT, AuthenticatedRequest, issueStreamToken, requireRole } from "../middleware/auth";
+import {
+  authenticateJWT,
+  AuthenticatedRequest,
+  issueMfaChallengeToken,
+  issueStreamToken,
+  requireRole,
+} from "../middleware/auth";
+import { completeSignIn, issueSessionToken, membershipsOf, NoMemberships } from "../session";
 import {
   assertOrganizationActive,
   closeOrganization,
@@ -20,55 +26,13 @@ import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
 import { checkPasswordStrength, clearFailedLogins, registerFailedLogin } from "../passwords";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "super-secret-medical-saas-key-change-in-production";
 
 /** Seeded to a new workspace on creation (arch.md section 3). */
 const TRIAL_CREDITS = 3;
 
-/**
- * A session token is scoped to ONE organization - the one the user is currently
- * acting in. A person may belong to several; switching is a new token, issued by
- * POST /switch-organization after verifying the membership.
- *
- * Keeping the active tenant in the token is what lets every downstream route go
- * on reading req.user.organizationId, and what keeps the RLS context a single
- * unambiguous value per request.
- */
-function issueSessionToken(user: { id: string; email: string }, orgId: string, role: "ORG_ADMIN" | "MEMBER") {
-  return jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-      organizationId: orgId,
-      role,
-    },
-    JWT_SECRET,
-    { expiresIn: "24h" }
-  );
-}
-
-/**
- * Every organization this person belongs to, with their role in each.
- *
- * Closed workspaces are excluded rather than deleted from memberships: the
- * membership row is the answer to "who had access to this tenant", which
- * outlives the tenant being switched off. Excluding here is also what makes
- * closure effective - no new token can name an organization that does not
- * appear in this list.
- */
-async function membershipsOf(userId: string) {
-  const rows = await systemDb
-    .select({
-      organizationId: memberships.organizationId,
-      role: memberships.role,
-      organizationName: organizations.name,
-    })
-    .from(memberships)
-    .innerJoin(organizations, eq(memberships.organizationId, organizations.id))
-    .where(and(eq(memberships.userId, userId), isNull(organizations.deletedAt)));
-
-  return rows;
-}
+// issueSessionToken and membershipsOf live in ../session, shared with the MFA
+// route: both paths end a sign-in, so both must apply the same membership rule
+// and write the same audit record.
 
 /**
  * 1. First-In Creator Signup
@@ -424,10 +388,6 @@ router.post("/login", async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    // A successful sign-in clears the counter: the lockout is meant to stop a
-    // run of guesses, not to accumulate over months of ordinary typos.
-    await clearFailedLogins(user.id);
-
     // Checked after the password rather than before it. Deactivation is not a
     // secret worth protecting from the account's owner, but it is one worth
     // protecting from someone guessing addresses: answering differently before
@@ -445,32 +405,36 @@ router.post("/login", async (req: Request, res: Response) => {
       return res.status(403).json({ error: "This account has been deactivated." });
     }
 
-    const list = await membershipsOf(user.id);
+    // The password is only the first factor when a second is enrolled. What
+    // comes back here is not a session: it names the user, carries no
+    // organization or role, expires in five minutes, and is refused by every
+    // authenticated route. The only thing it opens is the MFA challenge.
+    //
+    // The failure counter is deliberately NOT cleared here. Clearing it on a
+    // correct password would reset the limit on every attempt of a
+    // password-then-guess-the-code loop, leaving the second factor with no rate
+    // limit at all - which is the shape an attacker who already has the
+    // password is in. It is cleared when the sign-in actually completes.
+    if (user.mfaEnabledAt) {
+      return res.status(200).json({
+        mfaRequired: true,
+        mfaToken: issueMfaChallengeToken(user),
+      });
+    }
 
-    if (list.length === 0) {
+    // A completed sign-in clears the counter: the lockout is meant to stop a
+    // run of guesses, not to accumulate over months of ordinary typos.
+    await clearFailedLogins(user.id);
+
+    const signedIn = await completeSignIn(user, req, ["password"]);
+    return res.status(200).json(signedIn);
+
+  } catch (error) {
+    if (error instanceof NoMemberships) {
       return res.status(403).json({
         error: "This account does not belong to any organization. Ask an administrator for an invite link.",
       });
     }
-
-    const active = list[0];
-
-    await recordAuditEvent({
-      action: AUDIT_ACTIONS.LOGIN_SUCCEEDED,
-      organizationId: active.organizationId,
-      actorUserId: user.id,
-      actorEmail: user.email,
-      target: user.email,
-      metadata: { organizations: list.length },
-      ip: clientIp(req),
-    });
-
-    return res.status(200).json({
-      token: issueSessionToken(user, active.organizationId, active.role),
-      memberships: list,
-    });
-
-  } catch (error) {
     console.error("Login error:", error);
     return res.status(500).json({ error: "Internal server error" });
   }

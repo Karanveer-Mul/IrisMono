@@ -178,6 +178,27 @@ export function isEncrypted(stored: Buffer): boolean {
   return timingSafeEqual(stored.subarray(0, MAGIC.length), MAGIC);
 }
 
+/**
+ * Wrapping for secrets that belong to a person rather than to a tenant.
+ *
+ * A user's MFA secret cannot use a per-organization key: the same account can
+ * belong to several organizations, and its second factor is a property of the
+ * person, not of whichever workspace they happen to be acting in. So these go
+ * under the master key directly, which is one level shallower than the scan
+ * path - the same trade the tenant keys make, minus the containment.
+ *
+ * It is still worth doing. A database dump on its own then yields no usable
+ * TOTP secrets, which is the realistic exposure: dumps travel, get restored
+ * into staging, and end up in backups far more often than process memory does.
+ */
+export function sealWithMasterKey(plaintext: Buffer): string {
+  return seal(masterKey(), plaintext).toString("base64");
+}
+
+export function openWithMasterKey(sealed: string): Buffer {
+  return open(masterKey(), Buffer.from(sealed, "base64"));
+}
+
 /** Drops cached keys. Used by tests, and by key rotation. */
 export function clearKeyCache() {
   keyCache.clear();

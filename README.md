@@ -127,6 +127,7 @@ npm run test:sse         # cross-instance delivery and Last-Event-ID replay
 npm run test:observability  # probes, metrics, fleet visibility, correlation ids
 npm run test:security    # audit chain, invite caps, encryption at rest, lockout
 npm run test:retention   # deletes refused as superuser, closure, per-tenant expiry
+npm run test:mfa         # enrolment, replay refusal, recovery codes, throttling
 ```
 
 `test:sse` needs a **second API instance**, because a single-process test cannot distinguish a working bus from the in-process hub it replaced:
@@ -194,7 +195,8 @@ Storage and the ML model are both mocked for local development. Images go to `./
 - **Scans are encrypted at rest, per tenant.** Each organization has its own AES-256-GCM data key, stored only wrapped by `MASTER_KEY_BASE64`. Destroying one tenant's key makes that tenant's scans unreadable without touching anyone else's — which is how "delete our data" is honoured across object storage and backups. Leave `MASTER_KEY_BASE64` unset and scans are stored in the clear; it is deliberately not defaulted, because a hardcoded fallback would encrypt everything with a key published in this repository.
 - **The audit log is append-only and tamper-evident.** `audit_events` is hash-chained. `UPDATE`/`DELETE` are revoked from the application roles, a trigger blocks them for the owner too, and `GET /api/audit/verify` recomputes the chain and names the first row that does not verify. Sign-ins, invite activity (including every refusal and its reason), whitelist changes, and **every read of a scan** are recorded.
 - **Invite links expire and run out.** Default 25 uses and 30 days when unspecified, enforced by a `CHECK` constraint as well as by the handler, and `memberships.invite_id` records which link admitted whom.
-- **Sign-ins are throttled.** Five failures lock an account for 15 minutes, counted in the database so the limit does not divide by the number of API instances. Passwords are length-first: 12 characters minimum.
+- **Sign-ins are throttled.** Five failures lock an account for 15 minutes, counted in the database so the limit does not divide by the number of API instances. A wrong MFA code counts against the same lockout — the counter is cleared when a sign-in *completes*, not when the password verifies, or a password-then-guess-the-code loop would reset the limit on every attempt. Passwords are length-first: 12 characters minimum.
+- **MFA is available (TOTP).** Enrol with `POST /api/auth/mfa/setup` then `/confirm` — the secret does nothing until a code proves it, so an abandoned enrolment cannot lock an account out of itself. Once enabled, the password step returns a five-minute challenge token that is refused by every authenticated route, and the sign-in completes at `POST /api/auth/mfa/verify`. Ten single-use recovery codes are shown once. Secrets are stored wrapped by `MASTER_KEY_BASE64`, so enrolment requires it to be set. There is no dashboard UI for this yet, and **no self-service path for losing both the phone and the codes** — a reset over email would reduce the second factor to the strength of a mailbox, which is what it exists to stop being sufficient.
 - **The record cannot be deleted out from under itself.** Jobs, ledger entries, and the invites that admitted people reference their parents with `ON DELETE RESTRICT`, so deleting an organization or a user is refused rather than cascaded — including for a superuser at a `psql` prompt. Removing a customer is closure (`DELETE /api/auth/organization`, ORG_ADMIN), which stops the tenant acting and keeps everything else. Closure is not erasure: a tenant asking for their data to be destroyed is served by destroying their data key, which leaves the billing and audit metadata that must be retained. There is deliberately no button for closure in the dashboard — it is an API call, and an irreversible-looking one next to the upload form invites the accident it is hard to undo.
 - **Retention is per tenant.** `STORAGE_RETENTION_DAYS` is the platform default; a customer whose contract says seven days sets `retention_days` on their organization and the sweeper honours it. Only image bytes expire — job metadata stays for billing and audit — and an expired scan answers `410` with the date it was purged rather than a bare `404`, because "deleted on schedule" and "missing" are different answers.
 
@@ -204,7 +206,7 @@ Generate a master key with:
 node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ```
 
-**Not implemented**, and load-bearing for a real deployment: a KMS (the master key is an environment variable, so it shares a blast radius with the process that reads it), SSO/SAML, MFA, and DICOM de-identification. `AUDIT.md` §7 explains what each would take and why a half-version of it would be worse than its absence.
+**Not implemented**, and load-bearing for a real deployment: a KMS (the master key is an environment variable, so it shares a blast radius with the process that reads it), SSO/SAML, organization-wide enforcement of MFA, and DICOM de-identification. `AUDIT.md` §7 explains what each would take and why a half-version of it would be worse than its absence.
 
 ---
 

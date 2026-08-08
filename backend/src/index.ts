@@ -1,6 +1,7 @@
 import express from "express";
 import * as dotenv from "dotenv";
 import authRouter from "./routes/auth";
+import mfaRouter from "./routes/mfa";
 import jobsRouter from "./routes/jobs";
 import invitesRouter from "./routes/invites";
 import creditsRouter from "./routes/credits";
@@ -48,6 +49,9 @@ app.use(express.json());
 app.use(opsRouter);
 
 // Mount routers
+// Mounted before /api/auth so its own routes win: the auth router carries a
+// catch-all-shaped surface and this is the narrower prefix.
+app.use("/api/auth/mfa", mfaRouter);
 app.use("/api/auth", authRouter);
 app.use("/api/jobs", jobsRouter);
 app.use("/api/invites", invitesRouter);

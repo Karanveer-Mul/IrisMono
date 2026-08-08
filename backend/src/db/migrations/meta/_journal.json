@@ -92,6 +92,13 @@
       "when": 1786001100000,
       "tag": "0012_per_tenant_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1786001200000,
+      "tag": "0013_mfa",
+      "breakpoints": true
     }
   ]
 }
