@@ -97,6 +97,13 @@ async function run() {
   const domain = `ret-${stamp}.example.org`;
   const admin = await register(`ret.admin.${stamp}@${domain}`, `Retention Hospital ${stamp}`);
 
+  // This suite's fixture job is created once and deliberately left PENDING for
+  // the whole run - its point is to exist as a record the cascade/RESTRICT
+  // checks below can try to delete, not to be processed. Raised so the later
+  // reopen check (9) can still request a fresh job without colliding with the
+  // per-tenant concurrency limit that fixture leaves occupied.
+  await systemDb.execute(sql`UPDATE organizations SET max_concurrent_jobs = 10 WHERE id = ${admin.orgId}`);
+
   // A job and its ledger entries, so the organization has a record to protect.
   const requested = await post("/jobs/request", {}, admin.token);
   assert(requested.status === 200, `job request failed: ${JSON.stringify(requested.body)}`);

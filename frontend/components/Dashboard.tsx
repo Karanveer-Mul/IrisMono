@@ -18,6 +18,8 @@ interface OrganizationInfo {
   requireMfa?: boolean;
   /** How long scans are kept here; null means the platform default. */
   retentionDays?: number | null;
+  /** How many jobs this workspace may run at once; null means the platform default. */
+  maxConcurrentJobs?: number | null;
   /** Set once the workspace has been closed. The row survives; access does not. */
   deletedAt?: string | null;
 }
@@ -47,6 +49,8 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
   // What a null retentionDays resolves to on this deployment, so the panel can
   // name the number rather than the word "default".
   const [platformRetentionDays, setPlatformRetentionDays] = useState<number | null>(null);
+  // What a null maxConcurrentJobs resolves to, for the same reason.
+  const [platformMaxConcurrentJobs, setPlatformMaxConcurrentJobs] = useState<number | null>(null);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [activeJob, setActiveJob] = useState<AuditLog | null>(null);
   const [glowCredits, setGlowCredits] = useState(false);
@@ -71,6 +75,7 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
       // Trigger glow animation if balance changed (spend or refund)
       setMemberships(profile.memberships || []);
       setPlatformRetentionDays(profile.platformRetentionDays ?? null);
+      setPlatformMaxConcurrentJobs(profile.platformMaxConcurrentJobs ?? null);
 
       setOrg((prev) => {
         if (prev && prev.creditBalance !== profile.organization.creditBalance) {
@@ -459,6 +464,7 @@ export function Dashboard({ user, onLogout, onSwitchOrganization }: DashboardPro
             <WorkspacePanel
               org={org}
               platformRetentionDays={platformRetentionDays}
+              platformMaxConcurrentJobs={platformMaxConcurrentJobs}
               onChanged={loadProfileAndLogs}
             />
           )}

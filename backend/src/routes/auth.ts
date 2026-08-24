@@ -29,6 +29,7 @@ import {
 } from "../lifecycle";
 import { grantCredits } from "../credits";
 import { PLATFORM_RETENTION_DAYS } from "../retention";
+import { PLATFORM_MAX_CONCURRENT_JOBS } from "./jobs";
 import { AUDIT_ACTIONS, clientIp, recordAuditEvent } from "../audit";
 import { checkPasswordStrength, clearFailedLogins, registerFailedLogin } from "../passwords";
 
@@ -479,6 +480,8 @@ router.get("/profile", authenticateJWT, async (req: AuthenticatedRequest, res: R
       // profile because a tenant on the default has no other way to learn how
       // long their scans are actually kept.
       platformRetentionDays: PLATFORM_RETENTION_DAYS,
+      // Same reasoning for organizations.max_concurrent_jobs = NULL.
+      platformMaxConcurrentJobs: PLATFORM_MAX_CONCURRENT_JOBS,
       memberships: await membershipsOf(userId),
     });
   } catch (error) {
@@ -716,6 +719,74 @@ router.put(
       }
       console.error("Retention update error:", error);
       return res.status(500).json({ error: "Failed to update retention policy" });
+    }
+  }
+);
+
+/**
+ * 9b. Set how many jobs this workspace may run at once
+ *
+ * arch.md section 1 requires this be configuration, not a constant - a tenant
+ * provisioned a larger GPU pool is entitled to run more than one job at a
+ * time. Null restores the platform default for the same reason it does on
+ * retention: a tenant with no stated preference should track the deployment's
+ * policy rather than freeze today's number into their row.
+ */
+router.put(
+  "/organization/concurrency",
+  authenticateJWT,
+  requireRole("ORG_ADMIN"),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const orgId = req.user!.organizationId;
+    const { maxConcurrentJobs } = req.body ?? {};
+
+    const requested =
+      maxConcurrentJobs === null || maxConcurrentJobs === undefined ? null : Number(maxConcurrentJobs);
+
+    // Zero would mean "accept no jobs" here and "no limit" on the platform
+    // default - the same opposite-meanings trap retentionDays=0 sits in.
+    if (requested !== null && (!Number.isInteger(requested) || requested < 1 || requested > 1000)) {
+      return res.status(400).json({
+        error: "maxConcurrentJobs must be a whole number between 1 and 1000, or null for the platform default",
+      });
+    }
+
+    try {
+      const previous = await withTenant(orgId, async (tx) => {
+        await assertOrganizationActive(tx, orgId);
+
+        const current = await tx.query.organizations.findFirst({
+          where: eq(organizations.id, orgId),
+        });
+
+        await tx
+          .update(organizations)
+          .set({ maxConcurrentJobs: requested, updatedAt: new Date() })
+          .where(eq(organizations.id, orgId));
+
+        return current?.maxConcurrentJobs ?? null;
+      });
+
+      await recordAuditEvent({
+        action: AUDIT_ACTIONS.CONCURRENCY_CHANGED,
+        organizationId: orgId,
+        actorUserId: req.user!.id,
+        actorEmail: req.user!.email,
+        target: orgId,
+        metadata: { maxConcurrentJobs: requested, previous },
+        ip: clientIp(req),
+      });
+
+      return res.status(200).json({
+        maxConcurrentJobs: requested,
+        usingPlatformDefault: requested === null,
+      });
+    } catch (error) {
+      if (error instanceof OrganizationClosed) {
+        return res.status(410).json({ error: "This workspace has been closed" });
+      }
+      console.error("Concurrency update error:", error);
+      return res.status(500).json({ error: "Failed to update concurrency policy" });
     }
   }
 );

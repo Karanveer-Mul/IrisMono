@@ -61,6 +61,23 @@ const s3Client = new S3Client({
  */
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024);
 
+/**
+ * Platform default for how many jobs a tenant may hold PENDING/PROCESSING at
+ * once. arch.md section 1: "must restrict users via configuration to
+ * uploading exactly 1 image at a time" - configuration, not a constant, so
+ * organizations.max_concurrent_jobs overrides this per tenant (migration
+ * 0016). Exported so the profile endpoint can tell an administrator what the
+ * default actually is, the same reason PLATFORM_RETENTION_DAYS is exported.
+ */
+export const PLATFORM_MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS_DEFAULT || 1);
+
+/** Thrown when a tenant already has as many jobs in flight as its limit allows. */
+export class ConcurrencyLimitReached extends Error {
+  constructor(public readonly limit: number) {
+    super("CONCURRENCY_LIMIT_REACHED");
+  }
+}
+
 /** The eight bytes every PNG starts with. */
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -610,6 +627,24 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
       // would keep billing after the customer stopped.
       await assertOrganizationActive(tx, orgId);
 
+      // Locked before counting, and held until the new job row is inserted
+      // below: without the lock in place first, two concurrent requests could
+      // both count zero in-flight jobs and both pass a limit of one. This is
+      // the same row reserveCredit() locks further down - re-acquiring it
+      // there is a no-op within one transaction, not a second lock.
+      const locked = await tx.execute(
+        sql`SELECT max_concurrent_jobs FROM organizations WHERE id = ${orgId} FOR UPDATE`
+      );
+      const limit = Number(locked.rows[0]?.max_concurrent_jobs ?? PLATFORM_MAX_CONCURRENT_JOBS);
+
+      const active = await tx.execute(sql`
+        SELECT count(*)::int AS n FROM jobs
+         WHERE organization_id = ${orgId} AND status IN ('PENDING', 'PROCESSING')
+      `);
+      if (Number((active.rows[0] as any).n) >= limit) {
+        throw new ConcurrencyLimitReached(limit);
+      }
+
       const jobId = randomUUID();
       const s3Key = `org_id=${orgId}/jobs/${jobId}/raw.png`;
 
@@ -662,6 +697,12 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
     }
     if (error instanceof OrganizationClosed) {
       return res.status(410).json({ error: "This workspace has been closed and cannot start new jobs." });
+    }
+    if (error instanceof ConcurrencyLimitReached) {
+      return res.status(429).json({
+        error: `This workspace already has ${error.limit} job(s) in progress. Wait for one to finish before starting another.`,
+        limit: error.limit,
+      });
     }
     console.error("Queue job request error:", error);
     return res.status(500).json({ error: error.message || "Failed to initiate job" });

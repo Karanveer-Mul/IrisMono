@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import { apiFetch, removeToken } from "@/lib/api";
-import { Archive, RotateCcw, Timer } from "lucide-react";
+import { Archive, Gauge, RotateCcw, Timer } from "lucide-react";
 
 interface WorkspacePanelProps {
   /** The active organization, as the profile returns it. */
@@ -10,11 +10,14 @@ interface WorkspacePanelProps {
     id: string;
     name: string;
     retentionDays?: number | null;
+    maxConcurrentJobs?: number | null;
     deletedAt?: string | null;
   };
   /** What retentionDays = null resolves to on this deployment. */
   platformRetentionDays: number | null;
-  /** Re-reads the profile after retention, closure, or reopening changes it. */
+  /** What maxConcurrentJobs = null resolves to on this deployment. */
+  platformMaxConcurrentJobs: number | null;
+  /** Re-reads the profile after retention, concurrency, closure, or reopening changes it. */
   onChanged: () => void;
 }
 
@@ -25,9 +28,18 @@ interface WorkspacePanelProps {
  * has to be able to see and set without a support ticket, and a customer who
  * wants to leave should not have to ask someone to run a DELETE for them.
  */
-export function WorkspacePanel({ org, platformRetentionDays, onChanged }: WorkspacePanelProps) {
+export function WorkspacePanel({
+  org,
+  platformRetentionDays,
+  platformMaxConcurrentJobs,
+  onChanged,
+}: WorkspacePanelProps) {
   const usingDefault = org.retentionDays == null;
   const [days, setDays] = useState(usingDefault ? "" : String(org.retentionDays));
+  const usingDefaultConcurrency = org.maxConcurrentJobs == null;
+  const [concurrency, setConcurrency] = useState(
+    usingDefaultConcurrency ? "" : String(org.maxConcurrentJobs)
+  );
   const [confirmName, setConfirmName] = useState("");
   const [showClose, setShowClose] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -54,6 +66,29 @@ export function WorkspacePanel({ org, platformRetentionDays, onChanged }: Worksp
       onChanged();
     } catch (err: any) {
       setError(err.message || "Could not change the retention window");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveConcurrency = async (maxConcurrentJobs: number | null) => {
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      await apiFetch("/api/auth/organization/concurrency", {
+        method: "PUT",
+        body: { maxConcurrentJobs },
+      });
+      setConcurrency(maxConcurrentJobs === null ? "" : String(maxConcurrentJobs));
+      setNotice(
+        maxConcurrentJobs === null
+          ? "Now following the platform default."
+          : `Up to ${maxConcurrentJobs} job(s) may run here at once.`
+      );
+      onChanged();
+    } catch (err: any) {
+      setError(err.message || "Could not change the concurrency limit");
     } finally {
       setBusy(false);
     }
@@ -198,6 +233,69 @@ export function WorkspacePanel({ org, platformRetentionDays, onChanged }: Worksp
                   id="retention-default-btn"
                   disabled={busy}
                   onClick={() => saveRetention(null)}
+                >
+                  Use the default
+                </button>
+              )}
+            </form>
+          </div>
+
+          <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "1.25rem", marginBottom: "1.5rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.35rem" }}>
+              <Gauge size={16} style={{ color: "var(--text-muted)" }} />
+              <span style={{ fontSize: "0.9rem" }}>
+                Up to{" "}
+                <strong style={{ color: "#00f2fe" }}>
+                  {org.maxConcurrentJobs ?? platformMaxConcurrentJobs ?? "—"} job(s)
+                </strong>{" "}
+                may run here at once
+                {usingDefaultConcurrency && (
+                  <span style={{ color: "var(--text-muted)" }}> (platform default)</span>
+                )}
+              </span>
+            </div>
+
+            <p style={{ color: "var(--text-muted)", fontSize: "0.75rem", marginBottom: "0.75rem" }}>
+              A new job is refused once this many are already waiting or processing here, across
+              every member and every tab. Raise this only if this workspace has GPU capacity
+              provisioned to match.
+            </p>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveConcurrency(Number(concurrency));
+              }}
+              style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end" }}
+            >
+              <div className="form-group" style={{ marginBottom: 0, width: "9rem" }}>
+                <label className="form-label" htmlFor="concurrency-input">
+                  Concurrent jobs (1–1000)
+                </label>
+                <input
+                  id="concurrency-input"
+                  className="input-field"
+                  inputMode="numeric"
+                  placeholder={platformMaxConcurrentJobs ? String(platformMaxConcurrentJobs) : "1"}
+                  value={concurrency}
+                  onChange={(e) => setConcurrency(e.target.value.replace(/[^0-9]/g, ""))}
+                />
+              </div>
+              <button
+                type="submit"
+                className="btn"
+                id="concurrency-save-btn"
+                disabled={busy || concurrency === "" || Number(concurrency) < 1 || Number(concurrency) > 1000}
+              >
+                Save
+              </button>
+              {!usingDefaultConcurrency && (
+                <button
+                  type="button"
+                  className="btn"
+                  id="concurrency-default-btn"
+                  disabled={busy}
+                  onClick={() => saveConcurrency(null)}
                 >
                   Use the default
                 </button>

@@ -20,7 +20,8 @@
     "test:security": "tsx src/test-security.ts",
     "test:retention": "tsx src/test-retention.ts",
     "test:mfa": "tsx src/test-mfa.ts",
-    "test:sessions": "tsx src/test-sessions.ts"
+    "test:sessions": "tsx src/test-sessions.ts",
+    "test:concurrency": "tsx src/test-concurrency.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

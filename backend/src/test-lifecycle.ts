@@ -82,6 +82,14 @@ async function run() {
   const org = await register(`lifecycle.${stamp}@alpha-health.org`, `Lifecycle Hospital ${stamp}`);
   console.log(`Tenant ${org.orgId}, starting balance ${await balanceOf(org.orgId)}\n`);
 
+  // This suite deliberately holds several jobs in flight on one tenant at
+  // once - a VIP-routed job this local worker never consumes, a reclaimed
+  // job left PROCESSING, storage-event fixtures - to exercise dispatch,
+  // redelivery, and pagination rather than the per-tenant concurrency limit
+  // (see test-concurrency.ts for that). Raised here so those checks are not
+  // the ones that trip it.
+  await systemDb.execute(sql`UPDATE organizations SET max_concurrent_jobs = 50 WHERE id = ${org.orgId}`);
+
   // ---------------------------------------------------------------
   console.log("1. Abandoned reservation: PENDING but never dispatched");
   const abandoned = await reserveJob(org.token);

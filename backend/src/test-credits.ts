@@ -116,11 +116,20 @@ async function run() {
   await assertReconciled("after replay");
 
   console.log("\n5. Balance cannot go below zero, and a refused request writes nothing");
+  // One at a time and settled before the next reservation: the platform's
+  // default concurrency limit (src/routes/jobs.ts) refuses a second PENDING
+  // job for the same tenant, so draining the balance here has to go through
+  // the same lifecycle a real job would rather than stacking reservations.
   const spent: string[] = [];
   for (let i = 0; i < 3; i++) {
     const r = await reserveJob(org.token);
     assert(r.status === 200, `reservation ${i + 1} unexpectedly failed`);
     spent.push(r.body.jobId);
+    assert(await report(r.body.jobId, { status: "PROCESSING" }) === 200, `could not claim reservation ${i + 1}`);
+    assert(
+      await report(r.body.jobId, { status: "SUCCESS", modelVersion: "test-model-1" }) === 200,
+      `could not settle reservation ${i + 1}`
+    );
   }
   assert(await balanceOf(org.orgId) === 0, "balance should be exhausted");
 

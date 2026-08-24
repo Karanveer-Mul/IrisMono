@@ -40,6 +40,10 @@ export const organizations = pgTable("organizations", {
   // Sessions issued before this instant are refused for everyone in this
   // workspace. The blunt instrument, for an incident. See migration 0015.
   sessionsInvalidBefore: timestamp("sessions_invalid_before", { withTimezone: true }),
+  // How many PENDING/PROCESSING jobs this tenant may hold at once. NULL means
+  // the platform default (MAX_CONCURRENT_JOBS_DEFAULT), same convention as
+  // retentionDays above. See migration 0016.
+  maxConcurrentJobs: integer("max_concurrent_jobs"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
