@@ -55,11 +55,13 @@ These are problems with the *design*, not the code. They would survive fixing ev
 
 *Status:* **resolved.** Implemented as recommended — see "Credit ledger" in §7.
 
-### 2.2 Privilege inversion — the GPU worker writes the billing table
+### 2.2 Privilege inversion — the GPU worker writes the billing table *(resolved — see §7)*
 
 `worker.ts:67-132` holds full database credentials and directly mutates `organizations.credit_balance`. GPU workers are the least-trusted tier in this architecture: most horizontally scaled, most likely to run third-party model code, most likely to be preempted or run on spot capacity. Giving that tier write access to billing state is backwards.
 
 The design's own block diagram gets this right — step 6 shows the worker reporting completion to the Backend API, which owns finalization and notification. **The implementation diverged from its own blueprint.** The worker should hold queue credentials plus scoped object-storage access, and nothing else.
+
+*Status:* **resolved.** The worker holds no database credentials at all — it reports outcomes to `POST /jobs/:jobId/report`, and the API owns finalization, credit settlement, and notification. See "MEDIUM — the worker writes the database directly" in §4 and "SSE bus and replay" in §7. As of "Containerized GPU worker" in §7, it holds no long-lived cloud credentials with tenant-wide reach either.
 
 ### 2.3 The in-process SSE hub defeats the architecture it serves *(resolved — see §7)*
 
@@ -81,12 +83,14 @@ Because the missing replay forces a polling fallback regardless, and the product
 
 **Recommendation:** drive dispatch from a storage event notification (S3 event → queue, or MinIO bucket notification locally). Upload completion *becomes* the trigger, the third round trip disappears, and the client stops being load-bearing.
 
-### 2.5 The RLS design would not work even if it were applied
+### 2.5 The RLS design would not work even if it were applied *(resolved — see §7)*
 
 `architecture_specification.md` §1 defines policies keyed on `current_setting('app.current_organization_id')`. Two problems beyond the fact that none of it is in the migration:
 
 1. **Connection pooling makes this actively dangerous.** The app uses a shared `pg.Pool` (`src/db/index.ts:10`). Setting a session variable outside a transaction persists on that pooled connection and leaks to the *next request that borrows it* — a cross-tenant read that looks safe because "RLS is enabled." The correct pattern is `SET LOCAL` inside every transaction, or a connection per tenant.
 2. **Policies are inert against the table owner** unless `FORCE ROW LEVEL SECURITY` is set. The app connects as `postgres` (`docker-compose.yml`), which owns the tables. Even applied correctly, every policy would be bypassed.
+
+*Status:* **resolved**, both problems named here directly. `SET LOCAL` via a transaction-scoped `set_config` closes the pooled-connection leak; a non-superuser runtime role plus `FORCE ROW LEVEL SECURITY` closes the table-owner hole — see "How RLS was implemented" in §7. Verified by `npm run test:rls`, which runs its checks with the tenant predicate deliberately omitted, because that is the case a policy alone is supposed to catch.
 
 ### 2.6 "Hospital-grade security" reduces to a domain whitelist *(partly resolved — see §7)*
 
@@ -263,6 +267,8 @@ The immediate operational consequence: `npm run dev` (API) and `npm run worker:d
 
 See also §2.2 (trust boundary) and §2.3 (scalability).
 
+*Status:* **resolved.** The worker calls neither the database nor an in-process SSE hub anymore — it reports outcomes over HTTP to `POST /jobs/:jobId/report`, and the API is the only process that settles credits or publishes events, through the RabbitMQ-backed bus described in "SSE bus and replay" in §7. There is exactly one path to a browser now, not two, and one of them dead.
+
 ### MEDIUM — credit accounting edge cases
 
 The core reservation at `jobs.ts:74-113` is correct: it opens a transaction, takes `SELECT … FOR UPDATE` on the organization row, checks the balance, decrements, and inserts the job. The race the spec worried about is genuinely closed. The gaps are around it:
@@ -300,7 +306,7 @@ Separately, `worker.ts:16` opens its own independent connection rather than reus
 - **No pagination on `GET /api/jobs/logs`** (`jobs.ts:213`). It returns every job the organization has ever run, and the dashboard refetches it in full on mount and after every SSE event. Unbounded growth on a hot path.
 - **No `GET /api/jobs/:id`.** The client fetches the entire log list and finds its job by id (`Dashboard.tsx:60`, `:106-111`), including inside a 500ms `setTimeout` race after job creation.
 - ~~**The one-image-at-a-time rule is client-side only.**~~ *Resolved — see "Job concurrency" in §7.*
-- **Version skew.** `frontend` pins TypeScript `~6.0.2` and Vite `^8.1.1` while `backend` uses TypeScript `^5.5.2`. Not currently harmful — the two build independently — but worth aligning.
+- ~~**Version skew.**~~ *Resolved.* Vite is gone entirely — this finding predates the Next.js migration noted in §5. `backend`'s TypeScript is now `^5.9.0`, matching `frontend`; both build independently regardless, so this was cosmetic, not a real risk.
 
 ---
 
