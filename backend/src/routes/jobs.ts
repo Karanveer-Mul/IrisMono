@@ -19,8 +19,8 @@ import {
 } from "../crypto";
 import { sseHub } from "../sse";
 import { publishJobEvent } from "../sse/bus";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { S3Client } from "@aws-sdk/client-s3";
+import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { randomUUID } from "crypto";
 import { reserveCredit, refundCredit, InsufficientCredits } from "../credits";
@@ -59,10 +59,10 @@ const s3Client = new S3Client({
  * S3 directly.
  *
  * s3Client above holds one long-lived credential shared across every tenant -
- * correct for issuing a presigned URL at all, but that credential's own
- * permissions are the only thing bounding what a presigned URL scoped from it
- * could ever be made to reach, no matter how careful the PutObjectCommand
- * that generates one is. `org_id=<uuid>/` in the key is hygiene the server
+ * correct for issuing a presigned upload at all, but that credential's own
+ * permissions are the only thing bounding what a presigned upload scoped from
+ * it could ever be made to reach, no matter how carefully the request that
+ * generates one is built. `org_id=<uuid>/` in the key is hygiene the server
  * chooses to write, not a limit anything downstream is forced to respect.
  *
  * AWS_S3_ASSUME_ROLE_ARN turns this from a convention into one: when set,
@@ -765,27 +765,50 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
       return { jobId, s3Key };
     });
 
-    // d. Generate S3 presigned URL for the reserved job
+    // d. Generate the upload target for the reserved job
     let presignedUrl = "";
+    let uploadFields: Record<string, string> | undefined;
     const isMock = process.env.AWS_ACCESS_KEY_ID === "mock-key-id";
 
     if (isMock) {
-      // Local fallback: mock upload URL
+      // Local fallback: the mock upload route enforces the same size ceiling
+      // and PNG-signature check a real deployment gets from the conditions
+      // below - see MAX_UPLOAD_BYTES and PNG_SIGNATURE in the handler there.
       presignedUrl = `${req.protocol}://${req.get("host")}/api/jobs/mock-upload/${result.jobId}`;
     } else {
-      const command = new PutObjectCommand({
+      // Presigned POST, not presigned PUT (AUDIT.md section 2.4: "Presigned
+      // POST with a content-length-range condition is the correct
+      // primitive"). A PUT's signature only covers who may write to the key;
+      // S3 does not evaluate it against the body at all, so a PUT-signing
+      // deployment has no way to bound the upload size or type without the
+      // app sitting in the request path, which the whole point of a
+      // presigned URL is to avoid. A POST's conditions are evaluated by S3
+      // itself against the multipart body as it arrives, so the same size
+      // ceiling this app enforces for the mock path is enforced here even
+      // though this app never sees the bytes.
+      const scopedClient = await scopedS3ClientFor(orgId);
+      const post = await createPresignedPost(scopedClient, {
         Bucket: BUCKET_NAME,
         Key: result.s3Key,
-        ContentType: "image/png",
+        Expires: 3600,
+        Fields: { "Content-Type": "image/png" },
+        Conditions: [
+          ["content-length-range", 1, MAX_UPLOAD_BYTES],
+          { "Content-Type": "image/png" },
+        ],
       });
-      const scopedClient = await scopedS3ClientFor(orgId);
-      presignedUrl = await getSignedUrl(scopedClient, command, { expiresIn: 3600 });
+      presignedUrl = post.url;
+      uploadFields = post.fields;
     }
 
     return res.status(200).json({
       jobId: result.jobId,
       s3Key: result.s3Key,
       uploadUrl: presignedUrl,
+      // Present only for a real presigned POST. The mock path stays a plain
+      // PUT target, so a client has to branch on this rather than assume a
+      // shape from environment - see frontend/components/MaskUploader.tsx.
+      ...(uploadFields ? { uploadFields } : {}),
     });
 
   } catch (error: any) {

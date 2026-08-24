@@ -81,25 +81,43 @@ export function MaskUploader({ onJobCreated, activeJob, onJobFinalized }: MaskUp
     setUploadProgress("Reserving organization credit...");
 
     try {
-      // 1. Request presigned URL and reserve credit
+      // 1. Request an upload target and reserve credit
       const requestRes = await apiFetch("/api/jobs/request", {
         method: "POST",
       });
 
-      const { uploadUrl } = requestRes;
+      const { uploadUrl, uploadFields } = requestRes;
       setUploadProgress("Uploading raw image directly to storage...");
 
       // 2. Upload file directly to storage. That is the last step: completing
       // the upload is what queues the job, so there is no third call and no
       // window in which a stored image has nothing scheduled to process it.
       // Closing the tab here can no longer strand the reserved credit.
-      const uploadRes = await fetch(uploadUrl, {
-        method: "PUT",
-        body: file,
-        headers: {
-          "Content-Type": file.type,
-        },
-      });
+      //
+      // Two shapes depending on how the backend is configured (see
+      // POST /api/jobs/request in the backend): a plain PUT against the mock
+      // upload route locally, or a presigned POST with size/type conditions
+      // S3 itself enforces against real storage. uploadFields is present only
+      // for the latter - its absence is what tells this branch apart.
+      let uploadRes: Response;
+      if (uploadFields) {
+        const formData = new FormData();
+        for (const [key, value] of Object.entries(uploadFields)) {
+          formData.append(key, value as string);
+        }
+        // The file field must come after every other field in the body - S3
+        // ignores whatever follows it, and stops evaluating conditions there.
+        formData.append("file", file);
+        uploadRes = await fetch(uploadUrl, { method: "POST", body: formData });
+      } else {
+        uploadRes = await fetch(uploadUrl, {
+          method: "PUT",
+          body: file,
+          headers: {
+            "Content-Type": file.type,
+          },
+        });
+      }
 
       if (!uploadRes.ok) {
         // The storage layer rejects an oversized or non-PNG body and settles
