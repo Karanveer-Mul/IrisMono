@@ -21,6 +21,7 @@ import { sseHub } from "../sse";
 import { publishJobEvent } from "../sse/bus";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { randomUUID } from "crypto";
 import { reserveCredit, refundCredit, InsufficientCredits } from "../credits";
 import { assertOrganizationActive, OrganizationClosed } from "../lifecycle";
@@ -51,6 +52,101 @@ const s3Client = new S3Client({
   },
   forcePathStyle: true,
 });
+
+/**
+ * Per-tenant IAM: the AUDIT's "a prefix is a naming convention, not a
+ * boundary" (section 2.6), for the one identity in this system that speaks to
+ * S3 directly.
+ *
+ * s3Client above holds one long-lived credential shared across every tenant -
+ * correct for issuing a presigned URL at all, but that credential's own
+ * permissions are the only thing bounding what a presigned URL scoped from it
+ * could ever be made to reach, no matter how careful the PutObjectCommand
+ * that generates one is. `org_id=<uuid>/` in the key is hygiene the server
+ * chooses to write, not a limit anything downstream is forced to respect.
+ *
+ * AWS_S3_ASSUME_ROLE_ARN turns this from a convention into one: when set,
+ * every presigned URL is minted from temporary credentials obtained via STS
+ * AssumeRole with an inline session policy restricting them to that one
+ * tenant's prefix. The base role only has to be broad enough to cover the
+ * bucket; the session policy narrows it per call, so one shared identity
+ * still serves every tenant without any of them holding credentials that
+ * could reach another's prefix even if this handler had a bug in it. This is
+ * the standard pattern for a single application identity serving many
+ * tenants - the alternative, a distinct IAM principal per tenant, does not
+ * fit an app that authenticates to S3 with one shared credential to begin
+ * with.
+ *
+ * Unset, presigning falls back to the shared client exactly as before -
+ * nothing here changes local or mocked behaviour. Like KMS_KEY_ID in
+ * src/crypto.ts, this path is real code against the documented API and is
+ * exercised no more than that until something real is on the other end of
+ * AWS_S3_ASSUME_ROLE_ARN.
+ */
+const ASSUME_ROLE_ARN = process.env.AWS_S3_ASSUME_ROLE_ARN || null;
+const stsClient = ASSUME_ROLE_ARN
+  ? new STSClient({
+      region: AWS_REGION,
+      endpoint: process.env.AWS_STS_ENDPOINT || undefined,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "mock-key-id",
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "mock-secret-key",
+      },
+    })
+  : null;
+
+/**
+ * An S3 client whose credentials can reach only one tenant's prefix.
+ *
+ * Falls back to the shared client when AWS_S3_ASSUME_ROLE_ARN is unset, so
+ * every call site works unmodified in local/mocked development. When set,
+ * temporary credentials are requested fresh per call rather than cached: they
+ * are only good for the one presigned URL this request is about to mint, and
+ * caching would either hold a tenant's scoped credentials past the request
+ * that needed them or require reasoning about their expiry independently of
+ * anything else in this process.
+ */
+async function scopedS3ClientFor(organizationId: string): Promise<S3Client> {
+  if (!stsClient || !ASSUME_ROLE_ARN) return s3Client;
+
+  const sessionPolicy = JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Effect: "Allow",
+        Action: ["s3:PutObject"],
+        Resource: `arn:aws:s3:::${BUCKET_NAME}/org_id=${organizationId}/*`,
+      },
+    ],
+  });
+
+  const assumed = await stsClient.send(
+    new AssumeRoleCommand({
+      RoleArn: ASSUME_ROLE_ARN,
+      // Session names show up in CloudTrail: "who could this credential have
+      // reached" is answerable directly from the trail without joining back
+      // to this service's own logs.
+      RoleSessionName: `org-${organizationId}`.slice(0, 64),
+      Policy: sessionPolicy,
+      DurationSeconds: 900,
+    })
+  );
+
+  if (!assumed.Credentials?.AccessKeyId || !assumed.Credentials.SecretAccessKey) {
+    throw new Error(`AssumeRole for organization ${organizationId} returned no credentials`);
+  }
+
+  return new S3Client({
+    region: AWS_REGION,
+    endpoint: process.env.AWS_S3_ENDPOINT || undefined,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: assumed.Credentials.AccessKeyId,
+      secretAccessKey: assumed.Credentials.SecretAccessKey,
+      sessionToken: assumed.Credentials.SessionToken,
+    },
+  });
+}
 
 /**
  * Ceiling on a single uploaded scan.
@@ -682,7 +778,8 @@ router.post("/request", async (req: AuthenticatedRequest, res: Response) => {
         Key: result.s3Key,
         ContentType: "image/png",
       });
-      presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+      const scopedClient = await scopedS3ClientFor(orgId);
+      presignedUrl = await getSignedUrl(scopedClient, command, { expiresIn: 3600 });
     }
 
     return res.status(200).json({
