@@ -1,0 +1,36 @@
+# The GPU worker, isolated in its own container (arch.md section 1:
+# "Isolated GPU worker containers via message queue"). It holds no database
+# credentials and no S3/KMS credentials with tenant-wide reach - see
+# src/worker.ts and AUDIT.md section 2.2 - so what it needs from its
+# environment is the broker, the API's report endpoint, and a filesystem it
+# shares with wherever the mock storage layer writes, nothing else.
+#
+# Build and run from backend/:
+#   docker build -f Dockerfile.worker -t irismono-worker .
+# Or via the worker service in docker-compose.yml, which also wires the
+# broker network and the shared uploads volume.
+
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+
+# Matches src/worker.ts's path.join(__dirname, "../../uploads") resolving to
+# /uploads from /app/dist - the mock storage directory the API (running on
+# the host in this project's dev setup) also reads and writes. A real
+# deployment replaces this whole volume with S3/object-storage credentials
+# scoped by src/routes/jobs.ts's scopedS3ClientFor, and the worker would hold
+# none of them either way.
+VOLUME ["/uploads"]
+
+CMD ["node", "dist/worker.js"]
